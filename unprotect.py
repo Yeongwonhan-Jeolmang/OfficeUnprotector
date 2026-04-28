@@ -46,3 +46,33 @@ def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
             data = new_content if item.filename == filename_in_zip else zin.read(item.filename)
             zout.writestr(item, data)
     os.replace(tmp_zip, zip_path)
+
+# PDF Functions
+
+def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        print("Missing dependency! Please run: pip install pypdf")
+        return False
+    
+    reader = PdfReader(input_path)
+
+    if reader.is_encrypted:
+        if not password:
+            print("Error: PDF is encrypted but no password was given.")
+            return False
+        result = reader.decrypt(password)
+        if result == 0:
+            print("Error: Wrong password!")
+            return False
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    print(f"PDF has been unprotected: {output_path}")
+    return True
