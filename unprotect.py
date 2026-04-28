@@ -76,3 +76,42 @@ def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
 
     print(f"PDF has been unprotected: {output_path}")
     return True
+
+    # Excel
+
+def unprotect_excel(input_path: str, password: str, output_path: str) -> bool:
+    tmp_path = output_path + ".tmp.xlsx"
+    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
+    work_path = tmp_path if was_encrypted else input_path
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(work_path)
+
+        # Remove workbook-level protection
+        if wb.security and wb.security.workbookPassword:
+            wb.security.workbookPassword = None
+            wb.security.lockStructure = False
+            wb.security.lockWindows = False
+
+        # Remove sheet-level protection from every sheet
+        for sheet in wb.worksheets:
+            if sheet.protection.sheet:
+                sheet.protection.sheet = False
+                sheet.protection.password = None
+
+        wb.save(output_path)
+    except ImportError:
+        print("Missing dependency! Please run: pip install openpyxl")
+        _cleanup(tmp_path)
+        return False
+    except Exception as e:
+        print(f"Error removing sheet protection: {e}")
+        _cleanup(tmp_path)
+        return False
+
+    _cleanup(tmp_path)
+    print(f"Excel file has been unprotected: {output_path}")
+    return True
+
+# Word
