@@ -192,3 +192,50 @@ def unprotect_powerpoint(input_path: str, password: str, output_path: str) -> bo
  
     print(f"✓ PowerPoint file unprotected: {output_path}")
     return True
+
+# Main
+
+SUPPORTED = {
+    ".pdf":  ("PDF",        unprotect_pdf),
+    ".xlsx": ("Excel",      unprotect_excel),
+    ".xlsm": ("Excel",      unprotect_excel),
+    ".xls":  ("Excel",      unprotect_excel),
+    ".docx": ("Word",       unprotect_word),
+    ".doc":  ("Word",       unprotect_word),
+    ".pptx": ("PowerPoint", unprotect_powerpoint),
+    ".ppt":  ("PowerPoint", unprotect_powerpoint),
+}
+
+def main():
+    parser = argparse.ArgumentParser(description="Remove password protection from PDF and Office 365 files.")
+    parser.add_argument("file", help="Path to the protected file")
+    parser.add_argument("password", nargs="?", default=None, help="Password to unlock the file (omit if no open password)")
+    parser.add_argument("--output", "-o", default=None, help="Output file path (default: unlocked_<filename>)")
+    args = parser.parse_args()
+
+    input_path = args.file
+    password = args.password
+
+    if not os.path.exists(input_path):
+        print(f"Error: File not found: {input_path}")
+        sys.exit(1)
+    
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if ext not in SUPPORTED:
+        supported_list = ", ".join(SUPPORTED.keys())
+        print(f"Error: Unsupported file type '{ext}'. Supported: {supported_list}")
+        sys.exit(1)
+
+    label, handler = SUPPORTED[ext]
+    base = os.path.basename(input_path)
+    name, suffix = os.path.splitext(base)
+
+    output_path = args.output or os.path.join(os.path.dirname(input_path) or ".", f"unlocked_{name}{suffix}")
+
+    print(f"Processing {label} file: {input_path}")
+    success = handler(input_path, password, output_path)
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
