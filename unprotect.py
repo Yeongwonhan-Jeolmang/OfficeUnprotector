@@ -115,3 +115,80 @@ def unprotect_excel(input_path: str, password: str, output_path: str) -> bool:
     return True
 
 # Word
+def unprotect_word(input_path: str, password: str, output_path: str) -> bool:
+    tmp_path = output_path + ".tmp.docx"
+    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
+    work_path = tmp_path if was_encrypted else input_path
+
+    shutil.copy2(work_path, output_path)
+    _cleanup(tmp_path)
+
+    try:
+        import lxml.etree as etree # Pyright has an aneurysm on etree or else i would have used "from lxml import etree"
+
+        with zipfile.ZipFile(output_path, "r") as z:
+            settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
+            if settings_name is None:
+                print(f"Word file is unprotected (no settings have been found): {output_path}")
+                return True
+            settings_xml = z.read(settings_name)
+
+        root = etree.fromstring(settings_xml)
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+        for tag in ["documentProtection", "writeProtection"]:
+            for el in root.findall(f"{{{ns}}}{tag}"):
+                root.remove(el)
+
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF8", standalone=True)
+        _rewrite_zip(output_path, settings_name, new_xml)
+
+    except ImportError:
+        print("Missing dependency! Please run: pip install lxml")
+        return False
+    except Exception as e:
+        print(f"Error trying to remove Word protection: {e}")
+        return False
+
+    print(f"Word file has been unprotected: {output_path}")
+    return True
+
+# Powerpoint
+
+def unprotect_powerpoint(input_path: str, password: str, output_path: str) -> bool:
+    tmp_path = output_path + ".tmp.pptx"
+    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
+    work_path = tmp_path if was_encrypted else input_path
+ 
+    shutil.copy2(work_path, output_path)
+    _cleanup(tmp_path)
+ 
+    try:
+        import lxml.etree as etree
+ 
+        with zipfile.ZipFile(output_path, "r") as z:
+            prs_name = next((n for n in z.namelist() if n.endswith("presentation.xml")), None)
+            if prs_name is None:
+                print(f"✓ PowerPoint file unprotected (no presentation.xml): {output_path}")
+                return True
+            prs_xml = z.read(prs_name)
+ 
+        root = etree.fromstring(prs_xml)
+        ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+ 
+        for tag in ["modifyVerifier", "writeProtection"]:
+            for el in root.findall(f"{{{ns}}}{tag}"):
+                root.remove(el)
+ 
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        _rewrite_zip(output_path, prs_name, new_xml)
+ 
+    except ImportError:
+        print("Missing dependency. Run: pip install lxml")
+        return False
+    except Exception as e:
+        print(f"Error removing PowerPoint protection: {e}")
+        return False
+ 
+    print(f"✓ PowerPoint file unprotected: {output_path}")
+    return True
