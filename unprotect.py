@@ -435,35 +435,62 @@ def process_file(input_path: str, password: str | None, output_arg: str | None, 
     return handler(input_path, password, output_path)
 
 def main():
-    parser = argparse.ArgumentParser(description="Remove password protection from PDF and Office 365 files.")
-    parser.add_argument("file", help="Path to the protected file")
-    parser.add_argument("password", nargs="?", default=None, help="Password to unlock the file (omit if no open password)")
-    parser.add_argument("--output", "-o", default=None, help="Output file path (default: unlocked_<filename>)")
+    parser = argparse.ArgumentParser(
+        description="Remove password protection from PDF and Office files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        help="Path(s) or glob pattern(s) to protected file(s)",
+    )
+    parser.add_argument(
+        "password",
+        nargs="?",
+        default=None,
+        help="Password to unlock the file (omit if there is no open password)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Output file path. Only valid when processing a single file. "
+             "Default: unlocked_<filename> next to the original.",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite the original file instead of creating unlocked_<filename>.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Dry-run: report protection status without modifying any files.",
+    )
     args = parser.parse_args()
 
-    input_path = args.file
-    password = args.password
+    # Expand globs
+    input_paths: list[str] = []
+    for pattern in args.files:
+        expanded = glob.glob(pattern)
+        if expanded:
+            input_paths.extend(expanded)
+        else:
+            input_paths.append(pattern)  # keep as-is so we get a "not found" error
 
-    if not os.path.exists(input_path):
-        print(f"Error: File not found: {input_path}")
+    # --output is only meaningful for a single file
+    if args.output and len(input_paths) > 1:
+        print("Error: --output can only be used when processing a single file.")
         sys.exit(1)
-    
-    ext = os.path.splitext(input_path)[1].lower()
 
-    if ext not in SUPPORTED:
-        supported_list = ", ".join(SUPPORTED.keys())
-        print(f"Error: Unsupported file type '{ext}'. Supported: {supported_list}")
-        sys.exit(1)
+    exit_code = 0
+    for path in input_paths:
+        code = process_file(input_path=path, password=args.password, output_arg=args.output, in_place=args.in_place, check_only=args.check,)
+        if code != 0:
+            exit_code = code  # surface the last non-zero code
 
-    label, handler = SUPPORTED[ext]
-    base = os.path.basename(input_path)
-    name, suffix = os.path.splitext(base)
+    sys.exit(exit_code)
 
-    output_path = args.output or os.path.join(os.path.dirname(input_path) or ".", f"unlocked_{name}{suffix}")
-
-    print(f"Processing {label} file: {input_path}")
-    success = handler(input_path, password, output_path)
-    sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
     main()
