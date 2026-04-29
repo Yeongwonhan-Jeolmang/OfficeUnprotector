@@ -410,9 +410,7 @@ SUPPORTED: dict[str, tuple[str, Callable]] = {
 
 # Main
 
-def process_file(input_path: str, password: str | None,
-                 output_arg: str | None, in_place: bool,
-                 check_only: bool) -> int:
+def process_file(input_path: str, password: str | None, output_arg: str | None, in_place: bool, check_only: bool) -> int:
     """Process a single file. Returns an exit code."""
 
     if not os.path.exists(input_path):
