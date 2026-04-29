@@ -39,13 +39,18 @@ def _cleanup(path: str):
 
 
 def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
-    """Replace a single file inside a zip archive in-place"""
+    """Replace a single file inside a zip archive in-place
+    preserving compression type and metadata fopr every other entry"""
     tmp_zip = zip_path + ".zip.tmp"
     with zipfile.ZipFile(zip_path, "r") as zin, \
-        zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+        zipfile.ZipFile(tmp_zip, "w") as zout:
         for item in zin.infolist():
-            data = new_content if item.filename == filename_in_zip else zin.read(item.filename)
-            zout.writestr(item, data)
+            if item.filename == filename_in_zip:
+                # Write replacement with same compression as original
+                zout.writestr(item, new_content, compress_type=item.compress_type)
+            else:
+                # Copy verbatim, preserving all metadata
+                zout.writestr(item, zin.read(item.filename), compress_type=item.compress_type)
     os.replace(tmp_zip, zip_path)
 
 # PDF Functions
