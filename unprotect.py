@@ -163,12 +163,13 @@ def _check_xml_protection(input_path: str, ext: str) -> None:
 
 # PDF Functions
 
-def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
+def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> int:
+    """Returns 0 on success, 1 on error, 2 on wrong password"""
     try:
         from pypdf import PdfReader, PdfWriter
     except ImportError:
         print("Missing dependency! Please run: pip install pypdf")
-        return False
+        return 1
     
     reader = PdfReader(input_path)
 
@@ -179,7 +180,7 @@ def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
         result = reader.decrypt(password)
         if result == 0:
             print("Error: Wrong password!")
-            return False
+            return 2
 
     writer = PdfWriter()
     for page in reader.pages:
@@ -189,44 +190,74 @@ def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
         writer.write(f)
 
     print(f"PDF has been unprotected: {output_path}")
-    return True
+    return 0
 
     # Excel
 
-def unprotect_excel(input_path: str, password: str, output_path: str) -> bool:
+def unprotect_excel(input_path: str, password: str | None, output_path: str) -> int:
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if ext == ".xls":
+        print("Error: Legacy .xls format is not supported. The binary BIFF format requires a separate tool (e.g. LibreOffice). Convert to .xlsx first, then retry.")
+        return 1
+
     tmp_path = output_path + ".tmp.xlsx"
-    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
-    work_path = tmp_path if was_encrypted else input_path
-
     try:
-        from openpyxl import load_workbook
-        wb = load_workbook(work_path)
+        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
+        work_path = tmp_path if was_encrypted else input_path
 
-        # Remove workbook-level protection
-        if wb.security and wb.security.workbookPassword:
-            wb.security.workbookPassword = None
-            wb.security.lockStructure = False
-            wb.security.lockWindows = False
+        # Use direct XML manipulation (more reliable than openpyxl for hashed passwords)
+        shutil.copy2(work_path, output_path)
+        _strip_excel_xml_protection(output_path)
 
-        # Remove sheet-level protection from every sheet
-        for sheet in wb.worksheets:
-            if sheet.protection.sheet:
-                sheet.protection.sheet = False
-                sheet.protection.password = None
-
-        wb.save(output_path)
-    except ImportError:
-        print("Missing dependency! Please run: pip install openpyxl")
-        _cleanup(tmp_path)
-        return False
+    except SystemExit:
+        raise
     except Exception as e:
-        print(f"Error removing sheet protection: {e}")
+        print(f"Error removing Excel protection: {e}")
+        return 1
+    finally:
         _cleanup(tmp_path)
-        return False
 
-    _cleanup(tmp_path)
-    print(f"Excel file has been unprotected: {output_path}")
-    return True
+    print(f"Excel file unprotected: {output_path}")
+    return 0
+
+def _strip_excel_xml_protection(xlsx_path: str):
+    """Remove workbook-level and per-sheet protection by editing XML directly.
+    This handles modern hash-based protection (hashValue/saltValue) that
+    openpyxl's high-level API may leave behind."""
+    import lxml.etree as etree  # type: ignore[import]
+
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        names = z.namelist()
+
+        # Workbook protection
+        wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
+        if wb_name:
+            wb_xml = z.read(wb_name)
+            wb_root = etree.fromstring(wb_xml)
+            ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+            for el in wb_root.findall(f"{{{ns}}}workbookProtection"):
+                wb_root.remove(el)
+            new_wb_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            _rewrite_zip(xlsx_path, wb_name, new_wb_xml)
+
+        # Per-sheet protection
+        sheet_names = [n for n in names
+                       if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+
+    for sheet_name in sheet_names:
+        with zipfile.ZipFile(xlsx_path, "r") as z:
+            sheet_xml = z.read(sheet_name)
+        import lxml.etree as etree  # type: ignore[import]
+        root = etree.fromstring(sheet_xml)
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        changed = False
+        for el in root.findall(f"{{{ns}}}sheetProtection"):
+            root.remove(el)
+            changed = True
+        if changed:
+            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            _rewrite_zip(xlsx_path, sheet_name, new_xml)
 
 # Word
 def unprotect_word(input_path: str, password: str, output_path: str) -> bool:
