@@ -73,6 +73,94 @@ def _check_collision(input_path: str, output_path: str, in_place: bool):
         print("Error: Input and output paths resolve to the same file. Use --in-place to overwrite, or choose a different --output path.")
     sys.exit(1)
 
+# --check / dry-run functions
+
+def check_protection(input_path: str, password: str | None) -> None:
+    """Report whether a file is protected without modifying it."""
+    ext = os.path.splitext(input_path)[1].lower()
+
+    # Encryption check (all Office formats)
+    if ext in (".xlsx", ".xlsm", ".docx", ".pptx"):
+        try:
+            import msoffcrypto
+            with open(input_path, "rb") as f:
+                of = msoffcrypto.OfficeFile(f)
+                encrypted = of.is_encrypted()
+        except ImportError:
+            encrypted = False
+        if encrypted:
+            print(f"[ENCRYPTED]  {input_path}  (file-level password required to open)")
+        else:
+            _check_xml_protection(input_path, ext)
+
+    elif ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            r = PdfReader(input_path)
+            if r.is_encrypted:
+                print(f"[ENCRYPTED]  {input_path}  (PDF open password set)")
+            else:
+                print(f"[OPEN]       {input_path}  (no PDF encryption detected)")
+        except ImportError:
+            print("Missing dependency! Please run: pip install pypdf")
+    else:
+        print(f"[UNKNOWN]    {input_path}  (unsupported extension '{ext}')")
+
+
+def _check_xml_protection(input_path: str, ext: str) -> None:
+    """Inspect the XML inside an (unencrypted) Office ZIP for protection tags."""
+    protected_items: list[str] = []
+    try:
+        with zipfile.ZipFile(input_path, "r") as z:
+            names = z.namelist()
+
+            if ext in (".xlsx", ".xlsm"):
+                # Workbook-level
+                wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
+                if wb_name:
+                    import lxml.etree as etree  # type: ignore[import]
+                    root = etree.fromstring(z.read(wb_name))
+                    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                    if root.find(f"{{{ns}}}workbookProtection") is not None:
+                        protected_items.append("workbook structure")
+                # Per-sheet
+                for n in names:
+                    if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"):
+                        import lxml.etree as etree  # type: ignore[import]
+                        root = etree.fromstring(z.read(n))
+                        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                        if root.find(f"{{{ns}}}sheetProtection") is not None:
+                            protected_items.append(n)
+
+            elif ext == ".docx":
+                settings_name = next((n for n in names if n.endswith("settings.xml")), None)
+                if settings_name:
+                    import lxml.etree as etree  # type: ignore[import]
+                    root = etree.fromstring(z.read(settings_name))
+                    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    for tag in ("documentProtection", "writeProtection"):
+                        if root.find(f"{{{ns}}}{tag}") is not None:
+                            protected_items.append(tag)
+
+            elif ext == ".pptx":
+                prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
+                if prs_name:
+                    import lxml.etree as etree  # type: ignore[import]
+                    root = etree.fromstring(z.read(prs_name))
+                    ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+                    for tag in ("modifyVerifier", "writeProtection"):
+                        if root.find(f"{{{ns}}}{tag}") is not None:
+                            protected_items.append(tag)
+
+    except Exception as e:
+        print(f"[ERROR]      {input_path}  — could not inspect: {e}")
+        return
+
+    if protected_items:
+        print(f"[PROTECTED]  {input_path}  — {', '.join(protected_items)}")
+    else:
+        print(f"[OPEN]       {input_path}  — no protection detected")
+
 # PDF Functions
 
 def unprotect_pdf(input_path: str, password: str, output_path: str) -> bool:
