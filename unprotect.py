@@ -49,7 +49,7 @@ def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
                 # Write replacement with same compression as original
                 zout.writestr(item, new_content, compress_type=item.compress_type)
             else:
-                # Copy verbatim, preserving all metadata
+                # Copy verbatim, preserving all metadata++
                 zout.writestr(item, zin.read(item.filename), compress_type=item.compress_type)
     os.replace(tmp_zip, zip_path)
 
