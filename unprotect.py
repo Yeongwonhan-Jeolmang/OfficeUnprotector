@@ -410,6 +410,32 @@ SUPPORTED: dict[str, tuple[str, Callable]] = {
 
 # Main
 
+def process_file(input_path: str, password: str | None,
+                 output_arg: str | None, in_place: bool,
+                 check_only: bool) -> int:
+    """Process a single file. Returns an exit code."""
+
+    if not os.path.exists(input_path):
+        print(f"Error: File not found: {input_path}")
+        return 4
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext not in SUPPORTED:
+        supported_list = ", ".join(SUPPORTED.keys())
+        print(f"Error: Unsupported file type '{ext}'. Supported: {supported_list}")
+        return 3
+
+    if check_only:
+        check_protection(input_path, password)
+        return 0
+
+    label, handler = SUPPORTED[ext]
+    output_path = _resolve_output(input_path, output_arg, in_place)
+    _check_collision(input_path, output_path, in_place)
+
+    print(f"Processing {label} file: {input_path}")
+    return handler(input_path, password, output_path)
+
 def main():
     parser = argparse.ArgumentParser(description="Remove password protection from PDF and Office 365 files.")
     parser.add_argument("file", help="Path to the protected file")
