@@ -264,11 +264,7 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
     ext = os.path.splitext(input_path)[1].lower()
 
     if ext == ".doc":
-        print(
-            "Error: Legacy .doc format is not supported. "
-            "The binary format requires a separate tool (e.g. LibreOffice). "
-            "Convert to .docx first, then retry."
-        )
+        print("Error: Legacy .doc format is not supported. The binary format requires a separate tool (e.g. LibreOffice). Convert to .docx first, then retry.")
         return 1
 
     tmp_path = output_path + ".tmp.docx"
