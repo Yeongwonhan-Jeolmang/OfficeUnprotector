@@ -311,43 +311,86 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
 
 # Powerpoint
 
-def unprotect_powerpoint(input_path: str, password: str, output_path: str) -> bool:
+def unprotect_powerpoint(input_path: str, password: str | None, output_path: str) -> int:
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if ext == ".ppt":
+        print(
+            "Error: Legacy .ppt format is not supported. "
+            "The binary format requires a separate tool (e.g. LibreOffice). "
+            "Convert to .pptx first, then retry."
+        )
+        return 1
+
     tmp_path = output_path + ".tmp.pptx"
-    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
-    work_path = tmp_path if was_encrypted else input_path
- 
-    shutil.copy2(work_path, output_path)
-    _cleanup(tmp_path)
- 
     try:
-        import lxml.etree as etree
- 
+        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
+        work_path = tmp_path if was_encrypted else input_path
+
+        shutil.copy2(work_path, output_path)
+
+        import lxml.etree as etree  # type: ignore[import]
+
+        # Presentation-level protection
         with zipfile.ZipFile(output_path, "r") as z:
-            prs_name = next((n for n in z.namelist() if n.endswith("presentation.xml")), None)
+            names = z.namelist()
+            prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
             if prs_name is None:
-                print(f"✓ PowerPoint file unprotected (no presentation.xml): {output_path}")
-                return True
+                print(f"✓ PowerPoint unprotected (no presentation.xml): {output_path}")
+                return 0
             prs_xml = z.read(prs_name)
- 
+
         root = etree.fromstring(prs_xml)
-        ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
- 
-        for tag in ["modifyVerifier", "writeProtection"]:
-            for el in root.findall(f"{{{ns}}}{tag}"):
+        ns_pml = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        changed = False
+        for tag in ("modifyVerifier", "writeProtection"):
+            for el in root.findall(f"{{{ns_pml}}}{tag}"):
                 root.remove(el)
- 
-        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-        _rewrite_zip(output_path, prs_name, new_xml)
- 
+                changed = True
+
+        if changed:
+            new_xml = etree.tostring(root, xml_declaration=True,
+                                     encoding="UTF-8", standalone=True)
+            _rewrite_zip(output_path, prs_name, new_xml)
+
+        # Per-slide protection (oleObj / AlternateContent locks)
+        with zipfile.ZipFile(output_path, "r") as z:
+            slide_names = [n for n in z.namelist()
+                           if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
+
+        for slide_name in slide_names:
+            with zipfile.ZipFile(output_path, "r") as z:
+                slide_xml = z.read(slide_name)
+            slide_root = etree.fromstring(slide_xml)
+
+            # Remove mc:AlternateContent blocks that wrap locked OLE objects
+            mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+            slide_changed = False
+            for ac in slide_root.findall(f".//{{{mc_ns}}}AlternateContent"):
+                parent = ac.getparent()
+                if parent is not None:
+                    # Only remove if it wraps a locked oleObj
+                    if b"oleObj" in etree.tostring(ac) and b"locked" in etree.tostring(ac):
+                        parent.remove(ac)
+                        slide_changed = True
+
+            if slide_changed:
+                new_slide_xml = etree.tostring(slide_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                _rewrite_zip(output_path, slide_name, new_slide_xml)
+
     except ImportError:
-        print("Missing dependency. Run: pip install lxml")
-        return False
+        print("Missing dependency! Please run: pip install lxml")
+        return 1
+    except SystemExit:
+        raise
     except Exception as e:
         print(f"Error removing PowerPoint protection: {e}")
-        return False
- 
-    print(f"✓ PowerPoint file unprotected: {output_path}")
-    return True
+        return 1
+    finally:
+        _cleanup(tmp_path)
+
+    print(f"PowerPoint unprotected: {output_path}")
+    return 0
 
 # Dispatch table
 
