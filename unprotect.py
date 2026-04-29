@@ -2,8 +2,10 @@
 import sys
 import os
 import argparse
+import glob
 import shutil
 import zipfile
+from typing import Callable
 
 # Helper functions
 
@@ -22,14 +24,14 @@ def _msoffcrypto_decrypt(input_path: str, password: str, tmp_path: str) -> bool:
             return False # not encrypted so skip the decryption step
         if not password:
             print("Error: File is encrypted but no password was provided!")
-            sys.exit(1)
+            sys.exit(2)
         try:
             office_file.load_key(password=password)
             with open(tmp_path, "wb") as out:
                 office_file.decrypt(out)
         except Exception as e:
             print(f"Error: Couldn't decrypt file - {e}")
-            sys.exit(1)
+            sys.exit(2)
     return True
 
 
@@ -43,7 +45,7 @@ def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
     preserving compression type and metadata fopr every other entry"""
     tmp_zip = zip_path + ".zip.tmp"
     with zipfile.ZipFile(zip_path, "r") as zin, \
-        zipfile.ZipFile(tmp_zip, "w") as zout:
+        zipfile.ZipFile(tmp_zip, "w") as zout: # No forced ZIP_DEFLATED
         for item in zin.infolist():
             if item.filename == filename_in_zip:
                 # Write replacement with same compression as original
@@ -52,6 +54,24 @@ def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
                 # Copy verbatim, preserving all metadata++
                 zout.writestr(item, zin.read(item.filename), compress_type=item.compress_type)
     os.replace(tmp_zip, zip_path)
+
+def _resolve_output(input_path: str, output_arg: str | None, in_place: bool) -> str:
+
+    if in_place:
+        return input_path
+    if output_arg:
+        return output_arg
+    base = os.path.basename(input_path)
+    name, ext = os.path.splitext(base)
+    directory = os.path.dirname(input_path) or "."
+    return os.path.join(directory, f"unlocked_{name}{ext}")
+
+def _check_collision(input_path: str, output_path: str, in_place: bool):
+    if in_place:
+        return # intentional overwrite
+    if os.path.realpath(input_path) == os.path.realpath(output_path):
+        print("Error: Input and output paths resolve to the same file. Use --in-place to overwrite, or choose a different --output path.")
+    sys.exit(1)
 
 # PDF Functions
 
