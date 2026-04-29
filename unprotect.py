@@ -279,7 +279,7 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
         with zipfile.ZipFile(output_path, "r") as z:
             settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
             if settings_name is None:
-                print(f"✓ Word file unprotected (no settings.xml found): {output_path}")
+                print(f"Word file unprotected (no settings.xml found): {output_path}")
                 return 0
             settings_xml = z.read(settings_name)
 
@@ -292,8 +292,7 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
                 changed = True
 
         if changed:
-            new_xml = etree.tostring(root, xml_declaration=True,
-                                     encoding="UTF-8", standalone=True)
+            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(output_path, settings_name, new_xml)
 
     except ImportError:
@@ -307,7 +306,7 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
     finally:
         _cleanup(tmp_path)
 
-    print(f"✓ Word file unprotected: {output_path}")
+    print(f"Word file unprotected: {output_path}")
     return 0
 
 # Powerpoint
