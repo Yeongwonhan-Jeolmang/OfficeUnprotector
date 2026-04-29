@@ -260,54 +260,43 @@ def _strip_excel_xml_protection(xlsx_path: str):
             _rewrite_zip(xlsx_path, sheet_name, new_xml)
 
 # Word
-def unprotect_word(input_path: str, password: str | None, output_path: str) -> int:
-    ext = os.path.splitext(input_path)[1].lower()
-
-    if ext == ".doc":
-        print("Error: Legacy .doc format is not supported. The binary format requires a separate tool (e.g. LibreOffice). Convert to .docx first, then retry.")
-        return 1
-
+def unprotect_word(input_path: str, password: str, output_path: str) -> bool:
     tmp_path = output_path + ".tmp.docx"
+    was_encrypted = _msoffcrypto_decrypt(input_path, password, tmp_path)
+    work_path = tmp_path if was_encrypted else input_path
+
+    shutil.copy2(work_path, output_path)
+    _cleanup(tmp_path)
+
     try:
-        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
-        work_path = tmp_path if was_encrypted else input_path
-
-        shutil.copy2(work_path, output_path)
-
-        import lxml.etree as etree  # type: ignore[import]
+        import lxml.etree as etree # Pyright has an aneurysm on etree or else i would have used "from lxml import etree"
 
         with zipfile.ZipFile(output_path, "r") as z:
             settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
             if settings_name is None:
-                print(f"Word file unprotected (no settings.xml found): {output_path}")
-                return 0
+                print(f"Word file is unprotected (no settings have been found): {output_path}")
+                return True
             settings_xml = z.read(settings_name)
 
         root = etree.fromstring(settings_xml)
         ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-        changed = False
-        for tag in ("documentProtection", "writeProtection"):
+
+        for tag in ["documentProtection", "writeProtection"]:
             for el in root.findall(f"{{{ns}}}{tag}"):
                 root.remove(el)
-                changed = True
 
-        if changed:
-            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-            _rewrite_zip(output_path, settings_name, new_xml)
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF8", standalone=True)
+        _rewrite_zip(output_path, settings_name, new_xml)
 
     except ImportError:
         print("Missing dependency! Please run: pip install lxml")
-        return 1
-    except SystemExit:
-        raise
+        return False
     except Exception as e:
-        print(f"Error removing Word protection: {e}")
-        return 1
-    finally:
-        _cleanup(tmp_path)
+        print(f"Error trying to remove Word protection: {e}")
+        return False
 
-    print(f"Word file unprotected: {output_path}")
-    return 0
+    print(f"Word file has been unprotected: {output_path}")
+    return True
 
 # Powerpoint
 
@@ -349,18 +338,23 @@ def unprotect_powerpoint(input_path: str, password: str, output_path: str) -> bo
     print(f"✓ PowerPoint file unprotected: {output_path}")
     return True
 
-# Main
+# Dispatch table
 
-SUPPORTED = {
+# Maps extension -> (label, handler)
+# .xls / .doc / .ppt are actually intentionally kept so they get a clear error message :D
+# rather than an "unsupported file type" error.
+SUPPORTED: dict[str, tuple[str, Callable]] = {
     ".pdf":  ("PDF",        unprotect_pdf),
     ".xlsx": ("Excel",      unprotect_excel),
     ".xlsm": ("Excel",      unprotect_excel),
-    ".xls":  ("Excel",      unprotect_excel),
+    ".xls":  ("Excel",      unprotect_excel),   # will self-reject with a VERY helpful message (trust)
     ".docx": ("Word",       unprotect_word),
-    ".doc":  ("Word",       unprotect_word),
+    ".doc":  ("Word",       unprotect_word),    # will self-reject
     ".pptx": ("PowerPoint", unprotect_powerpoint),
-    ".ppt":  ("PowerPoint", unprotect_powerpoint),
+    ".ppt":  ("PowerPoint", unprotect_powerpoint),  # will self-reject
 }
+
+# Main
 
 def main():
     parser = argparse.ArgumentParser(description="Remove password protection from PDF and Office 365 files.")
