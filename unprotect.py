@@ -42,7 +42,7 @@ def _cleanup(path: str):
 
 def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
     """Replace a single file inside a zip archive in-place
-    preserving compression type and metadata fopr every other entry"""
+    preserving compression type and metadata for every other entry"""
     tmp_zip = zip_path + ".zip.tmp"
     with zipfile.ZipFile(zip_path, "r") as zin, \
         zipfile.ZipFile(tmp_zip, "w") as zout: # No forced ZIP_DEFLATED
@@ -71,7 +71,7 @@ def _check_collision(input_path: str, output_path: str, in_place: bool):
         return # intentional overwrite
     if os.path.realpath(input_path) == os.path.realpath(output_path):
         print("Error: Input and output paths resolve to the same file. Use --in-place to overwrite, or choose a different --output path.")
-    sys.exit(1)
+        sys.exit(1)
 
 # --check / dry-run functions
 
@@ -176,7 +176,7 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> in
     if reader.is_encrypted:
         if not password:
             print("Error: PDF is encrypted but no password was given.")
-            return False
+            return 1
         result = reader.decrypt(password)
         if result == 0:
             print("Error: Wrong password!")
@@ -192,7 +192,7 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> in
     print(f"PDF has been unprotected: {output_path}")
     return 0
 
-    # Excel
+# Excel functions
 
 def unprotect_excel(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
@@ -232,18 +232,20 @@ def _strip_excel_xml_protection(xlsx_path: str):
 
         # Workbook protection
         wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
-        if wb_name:
-            wb_xml = z.read(wb_name)
-            wb_root = etree.fromstring(wb_xml)
-            ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-            for el in wb_root.findall(f"{{{ns}}}workbookProtection"):
-                wb_root.remove(el)
-            new_wb_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
-            _rewrite_zip(xlsx_path, wb_name, new_wb_xml)
+        wb_xml = z.read(wb_name) if wb_name else None
 
         # Per-sheet protection
         sheet_names = [n for n in names
                        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+
+    # Rewrite workbook XML outside the with block so the ZIP is fully closed first
+    if wb_name and wb_xml is not None:
+        wb_root = etree.fromstring(wb_xml)
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        for el in wb_root.findall(f"{{{ns}}}workbookProtection"):
+            wb_root.remove(el)
+        new_wb_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        _rewrite_zip(xlsx_path, wb_name, new_wb_xml)
 
     for sheet_name in sheet_names:
         with zipfile.ZipFile(xlsx_path, "r") as z:
@@ -259,7 +261,8 @@ def _strip_excel_xml_protection(xlsx_path: str):
             new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(xlsx_path, sheet_name, new_xml)
 
-# Word
+# Word functions
+
 def unprotect_word(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
 
@@ -309,13 +312,17 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
     print(f"Word file unprotected: {output_path}")
     return 0
 
-# Powerpoint
+# Powerpoint functions
 
 def unprotect_powerpoint(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
 
     if ext == ".ppt":
-        print("Error: Legacy .ppt format is not supported. The binary format requires a separate tool (e.g. LibreOffice). Convert to .pptx first, then retry.")
+        print(
+            "Error: Legacy .ppt format is not supported. "
+            "The binary format requires a separate tool (e.g. LibreOffice). "
+            "Convert to .pptx first, then retry."
+        )
         return 1
 
     tmp_path = output_path + ".tmp.pptx"
@@ -345,7 +352,8 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
                 changed = True
 
         if changed:
-            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            new_xml = etree.tostring(root, xml_declaration=True,
+                                     encoding="UTF-8", standalone=True)
             _rewrite_zip(output_path, prs_name, new_xml)
 
         # Per-slide protection (oleObj / AlternateContent locks)
@@ -433,7 +441,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Remove password protection from PDF and Office files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     parser.add_argument(
         "files",
@@ -463,6 +470,10 @@ def main():
         help="Dry-run: report protection status without modifying any files.",
     )
     args = parser.parse_args()
+
+    if args.output and args.in_place:
+        print("Error: --output and --in-place are mutually exclusive.")
+        sys.exit(1)
 
     # Expand globs
     input_paths: list[str] = []
