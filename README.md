@@ -1,27 +1,31 @@
 # OfficeUnprotector
-A simple command-line tool to remove password protection from PDF and Office 365 files.
+
+A command-line tool to remove password protection from PDF and Office files.
 
 ## Requirements
 
-Python 3.7+ and the following packages:
+Python 3.10+ and the following packages:
 
 ```bash
-pip install pypdf msoffcrypto-tool openpyxl lxml
+pip install pypdf msoffcrypto-tool lxml
 ```
 
 ## Usage
 
 ```bash
-python unprotect.py <file> [password] [--output <output_file>]
+python unprotect.py <file> [password] [options]
+python unprotect.py <glob> [password] [options]
 ```
-
-### Arguments
 
 | Argument | Required | Description |
 |---|---|---|
-| `file` | Yes | Path to the protected file |
-| `password` | No | Password to unlock the file (omit if no open password) |
-| `--output` / `-o` | No | Custom output path (default: `unlocked_<filename>`) |
+| `file` / `glob` | Yes | One or more file paths or glob patterns |
+| `password` | No | Password to open the file (omit if only edit/sheet protection is set) |
+| `--output` / `-o` | No | Output path — single-file mode only (default: `unlocked_<filename>`) |
+| `--in-place` | No | Overwrite the original file instead of writing a new one |
+| `--check` | No | Report protection status without modifying any files |
+
+`--output` and `--in-place` are mutually exclusive. The original file is never modified unless `--in-place` is set.
 
 ## Examples
 
@@ -43,39 +47,47 @@ python unprotect.py document.pdf mypassword --output clean.pdf
 
 # File with only sheet/edit protection (no open password needed)
 python unprotect.py spreadsheet.xlsx
+
+# Check protection status without modifying anything
+python unprotect.py document.pdf --check
+
+# Overwrite the original file in place
+python unprotect.py report.docx mypassword --in-place
+
+# Process multiple files at once
+python unprotect.py file1.xlsx file2.xlsx mypassword
+
+# Process all Excel files in a directory
+python unprotect.py "*.xlsx" mypassword
 ```
 
 ## Supported Formats
 
-| Format | Extensions | What it removes |
+| Format | Extensions | What gets removed |
 |---|---|---|
 | PDF | `.pdf` | Open password / encryption |
-| Word | `.docx` `.doc` | Open password + document & write protection |
-| Excel | `.xlsx` `.xlsm` `.xls` | Open password + sheet & workbook protection |
-| PowerPoint | `.pptx` `.ppt` | Open password + modify & write protection |
+| Word | `.docx` | Open password + `documentProtection` / `writeProtection` |
+| Excel | `.xlsx` `.xlsm` | Open password + sheet and workbook protection |
+| PowerPoint | `.pptx` | Open password + `modifyVerifier` / `writeProtection` + locked OLE objects per-slide |
+
+> **Legacy formats** (`.doc`, `.xls`, `.ppt`) are not supported. Open the file in LibreOffice or Microsoft Office, save it as the modern format, then retry.
 
 ## How it works
 
-Each Office file type has two layers of protection the tool handles:
+Modern Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives containing XML. Protection sits on two independent layers:
 
-**Layer 1 — File encryption** (password to open): handled by `msoffcrypto-tool`, which decrypts the file before any further processing.
+**Layer 1 — file encryption** (password required to open): handled by `msoffcrypto-tool`, which decrypts the file into a temporary copy before any further processing.
 
-**Layer 2 — Edit/structure protection** (file opens but editing is locked):
-- **Excel** — removes sheet and workbook protection via `openpyxl`
-- **Word** — strips `documentProtection` and `writeProtection` tags from `settings.xml` inside the file
-- **PowerPoint** — strips `modifyVerifier` and `writeProtection` tags from `presentation.xml` inside the file
+**Layer 2 — edit/structure protection** (file opens fine, but editing is locked): handled by direct XML manipulation via `lxml`. The relevant protection elements are removed from the XML inside the ZIP, rewriting only those entries while preserving compression and metadata for everything else.
 
-## Notes
-
-- The original file is **never modified**. Output is always written to a new file.
-- If a file has no open password but has edit/sheet protection, you can omit the password argument.
-- Wrong passwords will exit with an error and leave the original file untouched.
-- `.doc` and `.ppt` (legacy binary formats) support file-level decryption but may have limited edit-protection removal compared to the modern XML-based formats.
+For PDFs, `pypdf` handles both decryption and reconstruction.
 
 ## Troubleshooting
 
-**`ModuleNotFoundError`** — run `pip install pypdf msoffcrypto-tool openpyxl lxml`
+**`ModuleNotFoundError`** — run `pip install pypdf msoffcrypto-tool lxml`
 
-**`Error: Wrong password`** — double-check the password and try again
+**`Error: Wrong password`** — double-check the password; the original file is left untouched
 
-**`Unsupported file type`** — only `.pdf`, `.docx`, `.doc`, `.xlsx`, `.xlsm`, `.xls`, `.pptx`, `.ppt` are supported
+**`Unsupported file type`** — only `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.pptx` are supported; convert legacy formats first
+
+**`--output` rejected with multiple files** — `--output` only works for a single file; use `--in-place` or omit it to get the default `unlocked_<filename>` naming for each file

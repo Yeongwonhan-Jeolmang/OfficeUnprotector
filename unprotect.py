@@ -315,11 +315,7 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
     ext = os.path.splitext(input_path)[1].lower()
 
     if ext == ".ppt":
-        print(
-            "Error: Legacy .ppt format is not supported. "
-            "The binary format requires a separate tool (e.g. LibreOffice). "
-            "Convert to .pptx first, then retry."
-        )
+        print("Error: Legacy .ppt format is not supported. The binary format requires a separate tool (e.g. LibreOffice). Convert to .pptx first, then retry.")
         return 1
 
     tmp_path = output_path + ".tmp.pptx"
@@ -336,7 +332,7 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
             names = z.namelist()
             prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
             if prs_name is None:
-                print(f"✓ PowerPoint unprotected (no presentation.xml): {output_path}")
+                print(f"PowerPoint unprotected (no presentation.xml): {output_path}")
                 return 0
             prs_xml = z.read(prs_name)
 
@@ -349,8 +345,7 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
                 changed = True
 
         if changed:
-            new_xml = etree.tostring(root, xml_declaration=True,
-                                     encoding="UTF-8", standalone=True)
+            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(output_path, prs_name, new_xml)
 
         # Per-slide protection (oleObj / AlternateContent locks)
