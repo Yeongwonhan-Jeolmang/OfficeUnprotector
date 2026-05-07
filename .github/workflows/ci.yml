@@ -78,9 +78,16 @@ jobs:
           inject_zip_xml("test_protected.xlsx", "workbook.xml", add_wb_protection)
 
           # xlsx: no protection (for --check open detection)
+          # openpyxl always serialises <workbookProtection>; strip it post-save.
           wb2 = Workbook()
           wb2.active["A1"] = "open"
           wb2.save("test_open.xlsx")
+
+          def remove_wb_protection(root):
+              ns_ = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+              for el in root.findall(f"{{{ns_}}}workbookProtection"):
+                  root.remove(el)
+          inject_zip_xml("test_open.xlsx", "workbook.xml", remove_wb_protection)
 
           # docx: documentProtection
           doc = Document()
