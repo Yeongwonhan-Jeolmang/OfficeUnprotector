@@ -77,6 +77,11 @@ jobs:
               el.set("lockStructure", "1")
           inject_zip_xml("test_protected.xlsx", "workbook.xml", add_wb_protection)
 
+          # xlsx: no protection (for --check open detection)
+          wb2 = Workbook()
+          wb2.active["A1"] = "open"
+          wb2.save("test_open.xlsx")
+
           # docx: documentProtection
           doc = Document()
           doc.add_paragraph("protected")
@@ -122,7 +127,7 @@ jobs:
           EOF
         shell: bash
 
-      # ── Protection detection (--check) ──────────────────────────────────────
+      # ── Protection detection (--check / --dry-run) ───────────────────────
 
       - name: "[check] Detects xlsx protection"
         run: python unprotect.py --check test_protected.xlsx
@@ -136,11 +141,51 @@ jobs:
       - name: "[check] Detects plain PDF as open"
         run: python unprotect.py --check test_plain.pdf
 
+      - name: "[check] --dry-run is accepted as alias for --check"
+        run: python unprotect.py --dry-run test_plain.pdf
+
       - name: "[check] Glob expansion works"
         run: python unprotect.py --check "test_protected.*"
         shell: bash
 
-      # ── Happy-path unprotect ─────────────────────────────────────────────────
+      - name: "[check] Detects open xlsx as open"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--check", "test_open.xlsx"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0
+          assert "[OPEN]" in r.stdout, f"Expected [OPEN] in output, got:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --check --json output ────────────────────────────────────────────
+
+      - name: "[check --json] Emits valid JSON for protected file"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, json
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--check", "--json",
+               "test_protected.xlsx", "test_plain.pdf"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Unexpected exit code {r.returncode}"
+          data = json.loads(r.stdout)
+          assert isinstance(data, list) and len(data) == 2, f"Expected 2 items, got: {data}"
+          xlsx = next(d for d in data if d["file"].endswith(".xlsx"))
+          assert xlsx["status"] == "protected", f"Expected protected, got {xlsx}"
+          assert isinstance(xlsx["layers"], list) and len(xlsx["layers"]) > 0
+          pdf = next(d for d in data if d["file"].endswith(".pdf"))
+          assert pdf["status"] == "open", f"Expected open, got {pdf}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── Happy-path unprotect ─────────────────────────────────────────────
 
       - name: "[xlsx] Removes workbook and sheet protection"
         run: |
@@ -174,7 +219,7 @@ jobs:
       - name: "[pdf] Unlocks user-password PDF with --password"
         run: python unprotect.py test_userpw.pdf --password secret -o out_userpw.pdf
 
-      # ── --in-place (Bug 1 regression) ───────────────────────────────────────
+      # ── --in-place ───────────────────────────────────────────────────────
 
       - name: "[in-place] xlsx unencrypted file does not crash"
         run: |
@@ -194,15 +239,250 @@ jobs:
           python unprotect.py inplace_test.pptx --in-place
           python unprotect.py --check inplace_test.pptx
 
-      # ── Error handling & exit codes ──────────────────────────────────────────
-      # subprocess.run() is used throughout so a non-zero exit from unprotect.py
-      # doesn't kill the step before we can assert the code. Also works on Windows.
+      # ── --backup ─────────────────────────────────────────────────────────
+
+      - name: "[backup] Creates .bak file alongside --in-place"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, os
+          import shutil
+          shutil.copy("test_protected.xlsx", "backup_test.xlsx")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "backup_test.xlsx", "--in-place", "--backup"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert os.path.exists("backup_test.xlsx.bak"), ".bak file was not created"
+          print("OK — .bak file exists")
+          EOF
+        shell: bash
+
+      # ── --output-dir ─────────────────────────────────────────────────────
+
+      - name: "[output-dir] Writes unlocked files into specified directory"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, os
+          r = subprocess.run(
+              [sys.executable, "unprotect.py",
+               "test_protected.xlsx", "test_protected.docx",
+               "--output-dir", "unlocked_out"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert os.path.exists("unlocked_out/unlocked_test_protected.xlsx")
+          assert os.path.exists("unlocked_out/unlocked_test_protected.docx")
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --no-overwrite ───────────────────────────────────────────────────
+
+      - name: "[no-overwrite] Skips file when output already exists"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, os, time
+          # Create output first
+          subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "-o", "no_ow_out.pdf"],
+                         check=True)
+          mtime_before = os.path.getmtime("no_ow_out.pdf")
+          time.sleep(0.05)
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_plain.pdf",
+               "-o", "no_ow_out.pdf", "--no-overwrite"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}"
+          mtime_after = os.path.getmtime("no_ow_out.pdf")
+          assert mtime_before == mtime_after, "File was overwritten despite --no-overwrite"
+          print("OK — file not touched")
+          EOF
+        shell: bash
+
+      # ── --fail-fast ──────────────────────────────────────────────────────
+
+      - name: "[fail-fast] Stops after first error"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          # Two bad files: first fails (not found), second would also fail.
+          # With --fail-fast we expect a single error and non-zero exit.
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "missing1.xlsx", "missing2.xlsx", "--fail-fast"],
+              capture_output=True, text=True
+          )
+          assert r.returncode != 0, "Expected non-zero exit with --fail-fast"
+          # Only one "Error" line should appear (stopped after the first)
+          error_lines = [l for l in r.stdout.splitlines() if l.startswith("Error")]
+          assert len(error_lines) == 1, f"Expected 1 error line, got {len(error_lines)}: {r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --verbose / --quiet ──────────────────────────────────────────────
+
+      - name: "[verbose] Shows extra detail"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--verbose",
+               "test_protected.xlsx", "-o", "verbose_out.xlsx"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          # --verbose should surface at least one debug-level line (e.g. "Removed" or "Rewrote")
+          assert any(kw in r.stdout for kw in ("Removed", "Rewrote", "Rewr")), \
+              f"No verbose output found:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      - name: "[quiet] Suppresses normal output"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--quiet",
+               "test_protected.xlsx", "-o", "quiet_out.xlsx"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert r.stdout.strip() == "", f"Expected no stdout with --quiet, got:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --password-file ──────────────────────────────────────────────────
+
+      - name: "[password-file] Reads password from file"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          with open("secret.txt", "w") as f:
+              f.write("secret\n")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_userpw.pdf",
+               "--password-file", "secret.txt", "-o", "pwfile_out.pdf"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --password-list ──────────────────────────────────────────────────
+
+      - name: "[password-list] Brute-forces correct password from wordlist"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          with open("wordlist.txt", "w") as f:
+              f.write("wrong1\nwrong2\nsecret\nwrong3\n")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_userpw.pdf",
+               "--password-list", "wordlist.txt", "-o", "bruteforce_out.pdf"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert "secret" in r.stdout, f"Expected found password in output:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      - name: "[password-list] Fails cleanly when no password matches"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          with open("badlist.txt", "w") as f:
+              f.write("nope\nalsonope\n")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_userpw.pdf",
+               "--password-list", "badlist.txt", "-o", "bl_out.pdf"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 2, f"Expected exit 2, got {r.returncode}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── --recursive ──────────────────────────────────────────────────────
+
+      - name: "[recursive] Finds files in subdirectories"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, os, shutil
+          os.makedirs("sub/deep", exist_ok=True)
+          shutil.copy("test_protected.xlsx", "sub/deep/nested.xlsx")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--check", "--recursive", "sub/**/*.xlsx"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert "nested.xlsx" in r.stdout, f"Expected nested.xlsx in output:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── Batch summary line ───────────────────────────────────────────────
+
+      - name: "[batch] Prints summary line for multiple files"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py",
+               "test_protected.xlsx", "test_protected.docx", "test_protected.pptx",
+               "--output-dir", "batch_out"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert "Done:" in r.stdout, f"Expected 'Done:' summary line:\n{r.stdout}"
+          assert "unlocked" in r.stdout
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── Library API ──────────────────────────────────────────────────────
+
+      - name: "[library] unprotect_file() and check_file() are importable and callable"
+        run: |
+          python - << 'EOF'
+          from unprotect import unprotect_file, check_file, FileResult, UnprotectError
+
+          # check_file returns a FileResult
+          result = check_file("test_protected.xlsx")
+          assert isinstance(result, FileResult)
+          assert result.status == "protected"
+          assert len(result.layers) > 0
+
+          result_open = check_file("test_plain.pdf")
+          assert result_open.status == "open"
+
+          # unprotect_file raises UnprotectError for missing files (not sys.exit)
+          try:
+              unprotect_file("nonexistent.pdf")
+              assert False, "Should have raised"
+          except UnprotectError as e:
+              assert e.code == 4
+              print(f"UnprotectError raised correctly: {e}")
+
+          # unprotect_file works end-to-end
+          r = unprotect_file("test_protected.xlsx", output_path="lib_out.xlsx")
+          assert isinstance(r, FileResult)
+          assert r.status == "unlocked"
+          print("OK")
+          EOF
+        shell: bash
+
+      # ── Error handling & exit codes ──────────────────────────────────────
 
       - name: "[error] Wrong PDF password returns exit code 2"
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf", "--password", "wrongpass"])
+          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf", "--password", "wrongpass"],
+                             capture_output=True)
           assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
@@ -212,7 +492,9 @@ jobs:
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf"])
+          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf"],
+                             capture_output=True)
+          # stdin is not a TTY in CI so no interactive prompt fires; file is encrypted → exit 1
           assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
           print("OK")
           EOF
@@ -222,7 +504,8 @@ jobs:
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "nonexistent.xlsx"])
+          r = subprocess.run([sys.executable, "unprotect.py", "nonexistent.xlsx"],
+                             capture_output=True)
           assert r.returncode == 4, f"Expected exit code 4, got {r.returncode}"
           print("OK")
           EOF
@@ -233,7 +516,8 @@ jobs:
           python - << 'EOF'
           import subprocess, sys
           open("dummy.csv", "w").close()
-          r = subprocess.run([sys.executable, "unprotect.py", "dummy.csv"])
+          r = subprocess.run([sys.executable, "unprotect.py", "dummy.csv"],
+                             capture_output=True)
           assert r.returncode == 3, f"Expected exit code 3, got {r.returncode}"
           print("OK")
           EOF
@@ -244,28 +528,36 @@ jobs:
           python - << 'EOF'
           import subprocess, sys
           open("dummy.xls", "w").close()
-          r = subprocess.run([sys.executable, "unprotect.py", "dummy.xls"])
+          r = subprocess.run([sys.executable, "unprotect.py", "dummy.xls"],
+                             capture_output=True)
           assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
           print("OK")
           EOF
         shell: bash
 
-      - name: "[error] --output and --in-place are mutually exclusive"
+      - name: "[error] --output and --in-place are mutually exclusive (argparse exit 2)"
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "--output", "out.pdf", "--in-place"])
-          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_plain.pdf", "--output", "out.pdf", "--in-place"],
+              capture_output=True)
+          # argparse parser.error() exits with code 2
+          assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
         shell: bash
 
-      - name: "[error] --output with multiple files is rejected"
+      - name: "[error] --output with multiple files is rejected (argparse exit 2)"
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "test_protected.xlsx", "--output", "out.pdf"])
-          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          r = subprocess.run(
+              [sys.executable, "unprotect.py",
+               "test_plain.pdf", "test_protected.xlsx", "--output", "out.pdf"],
+              capture_output=True)
+          # argparse parser.error() exits with code 2
+          assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
         shell: bash
@@ -274,8 +566,34 @@ jobs:
         run: |
           python - << 'EOF'
           import subprocess, sys
-          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "--output", "test_plain.pdf"])
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_plain.pdf", "--output", "test_plain.pdf"],
+              capture_output=True)
           assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
+        shell: bash
+
+      - name: "[error] --backup without --in-place is rejected (argparse exit 2)"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_plain.pdf", "--backup"],
+              capture_output=True)
+          assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
+          print("OK")
+          EOF
+        shell: bash
+
+      - name: "[error] --json without --check is rejected (argparse exit 2)"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "test_plain.pdf", "--json"],
+              capture_output=True)
+          assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
         shell: bash

@@ -54,15 +54,56 @@ python unprotect.py <file> [options]
 python unprotect.py <glob> [options]
 ```
 
-| Argument | Required | Description |
-|---|---|---|
-| `file` / `glob` | Yes | One or more file paths or glob patterns |
-| `--password` / `-p` | No | Password to open the file (omit if only edit/sheet protection is set) |
-| `--output` / `-o` | No | Output path — single-file mode only (default: `unlocked_<filename>`) |
-| `--in-place` | No | Overwrite the original file instead of writing a new one |
-| `--check` | No | Report protection status without modifying any files |
+### Password options *(mutually exclusive)*
 
-`--output` and `--in-place` are mutually exclusive. The original file is never modified unless `--in-place` is set.
+| Flag | Description |
+|---|---|
+| `--password PASSWORD`, `-p` | Password to open the file (omit if only edit/sheet protection is set) |
+| `--password-file FILE` | Read the password from the first line of a file (avoids shell history exposure) |
+| `--password-list WORDLIST` | Try every line of a file as a password (brute-force / forgot-password mode) |
+
+If none of these are given and the file turns out to be encrypted, you'll be prompted securely via `getpass` when running interactively. In non-interactive (piped/scripted) contexts no prompt fires and the tool errors cleanly.
+
+### Output options *(mutually exclusive)*
+
+| Flag | Description |
+|---|---|
+| `--output PATH`, `-o` | Output path — single-file mode only (default: `unlocked_<filename>`) |
+| `--in-place` | Overwrite the original file instead of writing a new one |
+| `--output-dir DIR` | Write all unlocked files into this directory (created if needed) |
+
+### Safety flags
+
+| Flag | Description |
+|---|---|
+| `--backup` | Create a `.bak` copy before modifying (requires `--in-place`) |
+| `--no-overwrite` | Skip files whose output already exists (useful for resumable batch jobs) |
+
+### Inspection
+
+| Flag | Description |
+|---|---|
+| `--check`, `--dry-run` | Report protection status without modifying any files |
+| `--json` | With `--check`: emit machine-readable JSON instead of human-readable text |
+
+### Directory walking
+
+| Flag | Description |
+|---|---|
+| `--recursive`, `-r` | Expand `**` in glob patterns to walk entire directory trees |
+
+### Error handling
+
+| Flag | Description |
+|---|---|
+| `--fail-fast` | Stop on the first error (default: continue and summarise at the end) |
+
+### Verbosity *(mutually exclusive)*
+
+| Flag | Description |
+|---|---|
+| `--verbose`, `-v` | Show which XML elements were removed, which files were rewritten, etc. |
+| `--quiet`, `-q` | Suppress all output except errors (useful for scripting) |
 
 ---
 
@@ -72,6 +113,9 @@ python unprotect.py <glob> [options]
 # Check protection status without modifying anything
 python unprotect.py document.pdf --check
 python unprotect.py "*.xlsx" --check
+
+# Machine-readable check, pipe to jq
+python unprotect.py --check --json "*.xlsx" | jq '.[] | select(.status == "protected")'
 
 # Unprotect a PDF (open password)
 python unprotect.py document.pdf -p mypassword
@@ -91,14 +135,63 @@ python unprotect.py spreadsheet.xlsx
 # Custom output path
 python unprotect.py document.pdf -p mypassword --output clean.pdf
 
-# Overwrite the original file in place
-python unprotect.py report.docx -p mypassword --in-place
+# Overwrite the original file in place, with a safety backup
+python unprotect.py report.docx -p mypassword --in-place --backup
 
 # Process multiple files at once
 python unprotect.py file1.xlsx file2.xlsx -p mypassword
 
-# Process all Excel files in a directory
-python unprotect.py "*.xlsx" -p mypassword
+# Batch unlock all Excel files in a directory tree
+python unprotect.py "**/*.xlsx" --recursive --output-dir ./unlocked/
+
+# Password from a file (avoids shell history exposure)
+python unprotect.py secret.xlsx --password-file ~/.mysecret
+
+# Brute-force a forgotten password
+python unprotect.py locked.xlsx --password-list common_passwords.txt
+
+# Skip files already unlocked from a previous run
+python unprotect.py "*.docx" --output-dir ./out/ --no-overwrite
+
+# Suppress all output (for use in scripts)
+python unprotect.py "*.pdf" -p mypassword --output-dir ./out/ --quiet
+
+# Stop on first failure (CI pipelines)
+python unprotect.py "*.xlsx" --output-dir ./out/ --fail-fast
+```
+
+When processing more than one file, a summary is printed at the end:
+
+```
+Done: 47 unlocked, 2 already open, 1 failed
+```
+
+---
+
+## --check / --json output
+
+Human-readable:
+```
+[PROTECTED]  report.xlsx  — workbook structure, xl/worksheets/sheet1.xml
+[OPEN]       slides.pptx  — no protection detected
+```
+
+JSON (`--check --json`):
+```json
+[
+  {
+    "file": "report.xlsx",
+    "status": "protected",
+    "layers": ["workbook structure", "xl/worksheets/sheet1.xml"],
+    "message": "workbook structure, xl/worksheets/sheet1.xml"
+  },
+  {
+    "file": "slides.pptx",
+    "status": "open",
+    "layers": [],
+    "message": "no protection detected"
+  }
+]
 ```
 
 ---
@@ -115,6 +208,48 @@ For PDFs, `pypdf` handles both decryption and reconstruction. PDFs with only an 
 
 ---
 
+## Library API
+
+`unprotect.py` can be imported directly into other Python projects. All functions raise `UnprotectError` instead of calling `sys.exit()`.
+
+```python
+from unprotect import unprotect_file, check_file, FileResult, UnprotectError
+
+# Inspect a file (read-only)
+result = check_file("report.xlsx")
+# result.status  → "protected" | "open" | "failed"
+# result.layers  → ["workbook structure", "xl/worksheets/sheet1.xml"]
+
+# Unlock a file
+try:
+    result = unprotect_file(
+        input_path="report.xlsx",
+        password="secret",       # optional
+        output_path="out.xlsx",  # optional; defaults to unlocked_report.xlsx
+        in_place=False,
+        output_dir=None,
+        backup=False,
+        no_overwrite=False,
+    )
+    # result.status → "unlocked" | "skipped"
+except UnprotectError as e:
+    print(f"Failed (code {e.code}): {e}")
+```
+
+---
+
+## Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | General error (unsupported format, missing dependency, etc.) |
+| `2` | Wrong or missing password / invalid argument combination |
+| `3` | Unsupported file extension |
+| `4` | File not found |
+
+---
+
 ## Troubleshooting
 
 **`ModuleNotFoundError`** — run `pip install pypdf msoffcrypto-tool lxml`
@@ -125,7 +260,7 @@ For PDFs, `pypdf` handles both decryption and reconstruction. PDFs with only an 
 
 **`Unsupported file type`** — only `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.pptx` are supported; convert legacy formats first
 
-**`--output` rejected with multiple files** — `--output` only works for a single file; use `--in-place` or omit it to get the default `unlocked_<filename>` naming for each file
+**`--output` rejected with multiple files** — `--output` only works for a single file; use `--output-dir` for batch jobs or omit it to get the default `unlocked_<filename>` naming
 
 ---
 
