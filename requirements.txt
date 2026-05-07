@@ -1,0 +1,6 @@
+# OfficeUnprotector — runtime dependencies
+# Install with: pip install -r requirements.txt
+ 
+msoffcrypto-tool>=5.0.0   # file-level Office encryption/decryption
+pypdf>=4.0.0              # PDF reading, decryption, and writing
+lxml>=4.9.0               # XML manipulation for Office ZIP internals

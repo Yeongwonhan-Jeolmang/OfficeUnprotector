@@ -1,0 +1,247 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # str | None union syntax requires Python 3.10+
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install msoffcrypto-tool pypdf lxml openpyxl python-pptx python-docx
+
+      - name: Verify CLI entry point works
+        run: python unprotect.py --help
+
+      - name: Create test fixtures
+        run: |
+          python - << 'EOF'
+          import zipfile, os
+          import lxml.etree as etree
+          from openpyxl import Workbook
+          from docx import Document
+          from pptx import Presentation
+          from pypdf import PdfWriter
+
+          NS_XLSX = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          NS_DOCX = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+          NS_PPTX = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+          def inject_zip_xml(path, target_suffix, mutate_fn):
+              with zipfile.ZipFile(path, "r") as z:
+                  names = z.namelist()
+                  target = next(n for n in names if n.endswith(target_suffix))
+                  xml = z.read(target)
+              root = etree.fromstring(xml)
+              mutate_fn(root)
+              new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+              tmp = path + ".tmp"
+              with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp, "w") as zout:
+                  for item in zin.infolist():
+                      data = new_xml if item.filename == target else zin.read(item.filename)
+                      zout.writestr(item, data, compress_type=item.compress_type)
+              os.replace(tmp, path)
+
+          # xlsx: workbook + sheet protection
+          wb = Workbook()
+          ws = wb.active
+          ws["A1"] = "protected"
+          ws.protection.sheet = True
+          wb.save("test_protected.xlsx")
+
+          def add_wb_protection(root):
+              el = etree.SubElement(root, f"{{{NS_XLSX}}}workbookProtection")
+              el.set("lockStructure", "1")
+          inject_zip_xml("test_protected.xlsx", "workbook.xml", add_wb_protection)
+
+          # docx: documentProtection
+          doc = Document()
+          doc.add_paragraph("protected")
+          doc.save("test_protected.docx")
+
+          def add_doc_protection(root):
+              el = etree.SubElement(root, f"{{{NS_DOCX}}}documentProtection")
+              el.set(f"{{{NS_DOCX}}}edit", "readOnly")
+          inject_zip_xml("test_protected.docx", "settings.xml", add_doc_protection)
+
+          # pptx: modifyVerifier
+          prs = Presentation()
+          prs.slides.add_slide(prs.slide_layouts[0])
+          prs.save("test_protected.pptx")
+
+          def add_pptx_protection(root):
+              el = etree.SubElement(root, f"{{{NS_PPTX}}}modifyVerifier")
+              el.set("algorithmName", "SHA-512")
+              el.set("hashValue", "fakehash==")
+          inject_zip_xml("test_protected.pptx", "presentation.xml", add_pptx_protection)
+
+          # pdf: owner-password-only (freely openable, editing restricted)
+          w = PdfWriter()
+          w.add_blank_page(200, 200)
+          w.encrypt(user_password="", owner_password="owneronly")
+          with open("test_owneronly.pdf", "wb") as f:
+              w.write(f)
+
+          # pdf: user+owner password
+          w2 = PdfWriter()
+          w2.add_blank_page(200, 200)
+          w2.encrypt(user_password="secret", owner_password="secret")
+          with open("test_userpw.pdf", "wb") as f:
+              w2.write(f)
+
+          # plain unencrypted pdf
+          w3 = PdfWriter()
+          w3.add_blank_page(200, 200)
+          with open("test_plain.pdf", "wb") as f:
+              w3.write(f)
+
+          print("All fixtures created.")
+          EOF
+        shell: bash
+
+      # ── Protection detection (--check) ──────────────────────────────────────
+
+      - name: "[check] Detects xlsx protection"
+        run: python unprotect.py --check test_protected.xlsx
+
+      - name: "[check] Detects docx protection"
+        run: python unprotect.py --check test_protected.docx
+
+      - name: "[check] Detects pptx protection"
+        run: python unprotect.py --check test_protected.pptx
+
+      - name: "[check] Detects plain PDF as open"
+        run: python unprotect.py --check test_plain.pdf
+
+      - name: "[check] Glob expansion works"
+        run: python unprotect.py --check "test_protected.*"
+        shell: bash
+
+      # ── Happy-path unprotect ─────────────────────────────────────────────────
+
+      - name: "[xlsx] Removes workbook and sheet protection"
+        run: |
+          python unprotect.py test_protected.xlsx -o out_protected.xlsx
+          python unprotect.py --check out_protected.xlsx
+
+      - name: "[docx] Removes document protection"
+        run: |
+          python unprotect.py test_protected.docx -o out_protected.docx
+          python unprotect.py --check out_protected.docx
+
+      - name: "[pptx] Removes modify verifier"
+        run: |
+          python unprotect.py test_protected.pptx -o out_protected.pptx
+          python unprotect.py --check out_protected.pptx
+
+      - name: "[pdf] Unprotects plain PDF"
+        run: python unprotect.py test_plain.pdf -o out_plain.pdf
+
+      - name: "[pdf] Unlocks owner-password-only PDF without --password"
+        run: |
+          python unprotect.py test_owneronly.pdf -o out_owneronly.pdf
+          python - << 'EOF'
+          from pypdf import PdfReader
+          r = PdfReader("out_owneronly.pdf")
+          assert not r.is_encrypted, "Expected PDF to be unencrypted after unprotect"
+          print("owner-password-only PDF correctly stripped.")
+          EOF
+        shell: bash
+
+      - name: "[pdf] Unlocks user-password PDF with --password"
+        run: python unprotect.py test_userpw.pdf --password secret -o out_userpw.pdf
+
+      # ── --in-place (Bug 1 regression) ───────────────────────────────────────
+
+      - name: "[in-place] xlsx unencrypted file does not crash"
+        run: |
+          cp test_protected.xlsx inplace_test.xlsx
+          python unprotect.py inplace_test.xlsx --in-place
+          python unprotect.py --check inplace_test.xlsx
+
+      - name: "[in-place] docx unencrypted file does not crash"
+        run: |
+          cp test_protected.docx inplace_test.docx
+          python unprotect.py inplace_test.docx --in-place
+          python unprotect.py --check inplace_test.docx
+
+      - name: "[in-place] pptx unencrypted file does not crash"
+        run: |
+          cp test_protected.pptx inplace_test.pptx
+          python unprotect.py inplace_test.pptx --in-place
+          python unprotect.py --check inplace_test.pptx
+
+      # ── Error handling & exit codes ──────────────────────────────────────────
+
+      - name: "[error] Wrong PDF password returns exit code 2"
+        run: |
+          python unprotect.py test_userpw.pdf --password wrongpass
+          if [ $? -ne 2 ]; then echo "Expected exit code 2"; exit 1; fi
+        shell: bash
+
+      - name: "[error] Missing password on encrypted PDF returns exit code 1"
+        run: |
+          python unprotect.py test_userpw.pdf
+          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+        shell: bash
+
+      - name: "[error] File not found returns exit code 4"
+        run: |
+          python unprotect.py nonexistent.xlsx
+          if [ $? -ne 4 ]; then echo "Expected exit code 4"; exit 1; fi
+        shell: bash
+
+      - name: "[error] Unsupported extension returns exit code 3"
+        run: |
+          echo "dummy" > dummy.csv
+          python unprotect.py dummy.csv
+          if [ $? -ne 3 ]; then echo "Expected exit code 3"; exit 1; fi
+        shell: bash
+
+      - name: "[error] Legacy .xls rejected with exit code 1"
+        run: |
+          echo "dummy" > dummy.xls
+          python unprotect.py dummy.xls
+          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+        shell: bash
+
+      - name: "[error] --output and --in-place are mutually exclusive"
+        run: |
+          python unprotect.py test_plain.pdf --output out.pdf --in-place
+          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+        shell: bash
+
+      - name: "[error] --output with multiple files is rejected"
+        run: |
+          python unprotect.py test_plain.pdf test_protected.xlsx --output out.pdf
+          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+        shell: bash
+
+      - name: "[error] Input/output collision without --in-place is rejected"
+        run: |
+          python unprotect.py test_plain.pdf --output test_plain.pdf
+          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+        shell: bash

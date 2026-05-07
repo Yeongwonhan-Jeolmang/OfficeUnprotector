@@ -7,21 +7,16 @@ import shutil
 import zipfile
 from typing import Callable
 
-# Helper functions
-
 def _msoffcrypto_decrypt(input_path: str, password: str, tmp_path: str) -> bool:
-    """Decrypt an encrypted Office file using msoffcrypto-tool.
-    Returns True if the file was encrypted and successfully decrypted."""
     try:
         import msoffcrypto
     except ImportError:
         print("Missing dependency! Please run: pip install msoffcrypto-tool")
         sys.exit(1)
-    
     with open(input_path, "rb") as f:
         office_file = msoffcrypto.OfficeFile(f)
         if not office_file.is_encrypted():
-            return False # not encrypted so skip the decryption step
+            return False
         if not password:
             print("Error: File is encrypted but no password was provided!")
             sys.exit(2)
@@ -34,29 +29,26 @@ def _msoffcrypto_decrypt(input_path: str, password: str, tmp_path: str) -> bool:
             sys.exit(2)
     return True
 
-
 def _cleanup(path: str):
     if path and os.path.exists(path):
         os.remove(path)
 
-
 def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
-    """Replace a single file inside a zip archive in-place
-    preserving compression type and metadata for every other entry"""
     tmp_zip = zip_path + ".zip.tmp"
-    with zipfile.ZipFile(zip_path, "r") as zin, \
-        zipfile.ZipFile(tmp_zip, "w") as zout: # No forced ZIP_DEFLATED
-        for item in zin.infolist():
-            if item.filename == filename_in_zip:
-                # Write replacement with same compression as original
-                zout.writestr(item, new_content, compress_type=item.compress_type)
-            else:
-                # Copy verbatim, preserving all metadata++
-                zout.writestr(item, zin.read(item.filename), compress_type=item.compress_type)
-    os.replace(tmp_zip, zip_path)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zin, \
+            zipfile.ZipFile(tmp_zip, "w") as zout:
+            for item in zin.infolist():
+                if item.filename == filename_in_zip:
+                    zout.writestr(item, new_content, compress_type=item.compress_type)
+                else:
+                    zout.writestr(item, zin.read(item.filename), compress_type=item.compress_type)
+        os.replace(tmp_zip, zip_path)
+    except:
+        _cleanup(tmp_zip)
+        raise
 
 def _resolve_output(input_path: str, output_arg: str | None, in_place: bool) -> str:
-
     if in_place:
         return input_path
     if output_arg:
@@ -68,18 +60,13 @@ def _resolve_output(input_path: str, output_arg: str | None, in_place: bool) -> 
 
 def _check_collision(input_path: str, output_path: str, in_place: bool):
     if in_place:
-        return # intentional overwrite
+        return
     if os.path.realpath(input_path) == os.path.realpath(output_path):
         print("Error: Input and output paths resolve to the same file. Use --in-place to overwrite, or choose a different --output path.")
         sys.exit(1)
 
-# --check / dry-run functions
-
 def check_protection(input_path: str, password: str | None) -> None:
-    """Report whether a file is protected without modifying it."""
     ext = os.path.splitext(input_path)[1].lower()
-
-    # Encryption check (all Office formats)
     if ext in (".xlsx", ".xlsm", ".docx", ".pptx"):
         try:
             import msoffcrypto
@@ -92,7 +79,6 @@ def check_protection(input_path: str, password: str | None) -> None:
             print(f"[ENCRYPTED]  {input_path}  (file-level password required to open)")
         else:
             _check_xml_protection(input_path, ext)
-
     elif ext == ".pdf":
         try:
             from pypdf import PdfReader
@@ -106,110 +92,90 @@ def check_protection(input_path: str, password: str | None) -> None:
     else:
         print(f"[UNKNOWN]    {input_path}  (unsupported extension '{ext}')")
 
-
 def _check_xml_protection(input_path: str, ext: str) -> None:
-    """Inspect the XML inside an (unencrypted) Office ZIP for protection tags."""
     protected_items: list[str] = []
     try:
         with zipfile.ZipFile(input_path, "r") as z:
             names = z.namelist()
-
             if ext in (".xlsx", ".xlsm"):
-                # Workbook-level
                 wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
                 if wb_name:
-                    import lxml.etree as etree  # type: ignore[import]
+                    import lxml.etree as etree
                     root = etree.fromstring(z.read(wb_name))
                     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
                     if root.find(f"{{{ns}}}workbookProtection") is not None:
                         protected_items.append("workbook structure")
-                # Per-sheet
                 for n in names:
                     if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"):
-                        import lxml.etree as etree  # type: ignore[import]
+                        import lxml.etree as etree
                         root = etree.fromstring(z.read(n))
                         ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
                         if root.find(f"{{{ns}}}sheetProtection") is not None:
                             protected_items.append(n)
-
             elif ext == ".docx":
                 settings_name = next((n for n in names if n.endswith("settings.xml")), None)
                 if settings_name:
-                    import lxml.etree as etree  # type: ignore[import]
+                    import lxml.etree as etree
                     root = etree.fromstring(z.read(settings_name))
                     ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                     for tag in ("documentProtection", "writeProtection"):
                         if root.find(f"{{{ns}}}{tag}") is not None:
                             protected_items.append(tag)
-
             elif ext == ".pptx":
                 prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
                 if prs_name:
-                    import lxml.etree as etree  # type: ignore[import]
+                    import lxml.etree as etree
                     root = etree.fromstring(z.read(prs_name))
                     ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
                     for tag in ("modifyVerifier", "writeProtection"):
                         if root.find(f"{{{ns}}}{tag}") is not None:
                             protected_items.append(tag)
-
     except Exception as e:
         print(f"[ERROR]      {input_path}  — could not inspect: {e}")
         return
-
     if protected_items:
         print(f"[PROTECTED]  {input_path}  — {', '.join(protected_items)}")
     else:
         print(f"[OPEN]       {input_path}  — no protection detected")
 
-# PDF Functions
-
 def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> int:
-    """Returns 0 on success, 1 on error, 2 on wrong password"""
     try:
         from pypdf import PdfReader, PdfWriter
     except ImportError:
         print("Missing dependency! Please run: pip install pypdf")
         return 1
-    
     reader = PdfReader(input_path)
-
     if reader.is_encrypted:
-        if not password:
-            print("Error: PDF is encrypted but no password was given.")
-            return 1
-        result = reader.decrypt(password)
+        # Try the provided password, or empty string first (handles owner-password-only PDFs
+        # that are freely openable but have editing/printing restrictions).
+        result = reader.decrypt(password or "")
         if result == 0:
-            print("Error: Wrong password!")
-            return 2
-
+            if password:
+                print("Error: Wrong password!")
+                return 2
+            else:
+                print("Error: PDF is encrypted and requires a password. Use --password.")
+                return 1
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
-
     with open(output_path, "wb") as f:
         writer.write(f)
-
     print(f"PDF has been unprotected: {output_path}")
     return 0
 
-# Excel functions
-
 def unprotect_excel(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
-
     if ext == ".xls":
-        print("Error: Legacy .xls format is not supported. The binary BIFF format requires a separate tool (e.g. LibreOffice). Convert to .xlsx first, then retry.")
+        print("Error: Legacy .xls format is not supported.")
         return 1
-
     tmp_path = output_path + ".tmp.xlsx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
         work_path = tmp_path if was_encrypted else input_path
-
-        # Use direct XML manipulation (more reliable than openpyxl for hashed passwords)
-        shutil.copy2(work_path, output_path)
+        if os.path.realpath(work_path) != os.path.realpath(output_path):
+            shutil.copy2(work_path, output_path)
         _strip_excel_xml_protection(output_path)
-
     except SystemExit:
         raise
     except Exception as e:
@@ -217,28 +183,17 @@ def unprotect_excel(input_path: str, password: str | None, output_path: str) -> 
         return 1
     finally:
         _cleanup(tmp_path)
-
     print(f"Excel file unprotected: {output_path}")
     return 0
 
 def _strip_excel_xml_protection(xlsx_path: str):
-    """Remove workbook-level and per-sheet protection by editing XML directly.
-    This handles modern hash-based protection (hashValue/saltValue) that
-    openpyxl's high-level API may leave behind."""
-    import lxml.etree as etree  # type: ignore[import]
-
+    import lxml.etree as etree
     with zipfile.ZipFile(xlsx_path, "r") as z:
         names = z.namelist()
-
-        # Workbook protection
         wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
         wb_xml = z.read(wb_name) if wb_name else None
-
-        # Per-sheet protection
         sheet_names = [n for n in names
                        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
-
-    # Rewrite workbook XML outside the with block so the ZIP is fully closed first
     if wb_name and wb_xml is not None:
         wb_root = etree.fromstring(wb_xml)
         ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -246,11 +201,9 @@ def _strip_excel_xml_protection(xlsx_path: str):
             wb_root.remove(el)
         new_wb_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
         _rewrite_zip(xlsx_path, wb_name, new_wb_xml)
-
     for sheet_name in sheet_names:
         with zipfile.ZipFile(xlsx_path, "r") as z:
             sheet_xml = z.read(sheet_name)
-        import lxml.etree as etree  # type: ignore[import]
         root = etree.fromstring(sheet_xml)
         ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         changed = False
@@ -261,31 +214,24 @@ def _strip_excel_xml_protection(xlsx_path: str):
             new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(xlsx_path, sheet_name, new_xml)
 
-# Word functions
-
 def unprotect_word(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
-
     if ext == ".doc":
-        print("Error: Legacy .doc format is not supported. The binary format requires a separate tool (e.g. LibreOffice). Convert to .docx first, then retry.")
+        print("Error: Legacy .doc format is not supported.")
         return 1
-
     tmp_path = output_path + ".tmp.docx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
         work_path = tmp_path if was_encrypted else input_path
-
-        shutil.copy2(work_path, output_path)
-
-        import lxml.etree as etree  # type: ignore[import]
-
+        if os.path.realpath(work_path) != os.path.realpath(output_path):
+            shutil.copy2(work_path, output_path)
+        import lxml.etree as etree
         with zipfile.ZipFile(output_path, "r") as z:
             settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
             if settings_name is None:
-                print(f"✓ Word file unprotected (no settings.xml found): {output_path}")
+                print(f"Word file unprotected (no settings.xml found): {output_path}")
                 return 0
             settings_xml = z.read(settings_name)
-
         root = etree.fromstring(settings_xml)
         ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
         changed = False
@@ -293,11 +239,9 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
             for el in root.findall(f"{{{ns}}}{tag}"):
                 root.remove(el)
                 changed = True
-
         if changed:
             new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(output_path, settings_name, new_xml)
-
     except ImportError:
         print("Missing dependency! Please run: pip install lxml")
         return 1
@@ -308,33 +252,21 @@ def unprotect_word(input_path: str, password: str | None, output_path: str) -> i
         return 1
     finally:
         _cleanup(tmp_path)
-
     print(f"Word file unprotected: {output_path}")
     return 0
 
-# Powerpoint functions
-
 def unprotect_powerpoint(input_path: str, password: str | None, output_path: str) -> int:
     ext = os.path.splitext(input_path)[1].lower()
-
     if ext == ".ppt":
-        print(
-            "Error: Legacy .ppt format is not supported. "
-            "The binary format requires a separate tool (e.g. LibreOffice). "
-            "Convert to .pptx first, then retry."
-        )
+        print("Error: Legacy .ppt format is not supported.")
         return 1
-
     tmp_path = output_path + ".tmp.pptx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
         work_path = tmp_path if was_encrypted else input_path
-
-        shutil.copy2(work_path, output_path)
-
-        import lxml.etree as etree  # type: ignore[import]
-
-        # Presentation-level protection
+        if os.path.realpath(work_path) != os.path.realpath(output_path):
+            shutil.copy2(work_path, output_path)
+        import lxml.etree as etree
         with zipfile.ZipFile(output_path, "r") as z:
             names = z.namelist()
             prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
@@ -342,7 +274,6 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
                 print(f"PowerPoint unprotected (no presentation.xml): {output_path}")
                 return 0
             prs_xml = z.read(prs_name)
-
         root = etree.fromstring(prs_xml)
         ns_pml = "http://schemas.openxmlformats.org/presentationml/2006/main"
         changed = False
@@ -350,37 +281,27 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
             for el in root.findall(f"{{{ns_pml}}}{tag}"):
                 root.remove(el)
                 changed = True
-
         if changed:
-            new_xml = etree.tostring(root, xml_declaration=True,
-                                     encoding="UTF-8", standalone=True)
+            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
             _rewrite_zip(output_path, prs_name, new_xml)
-
-        # Per-slide protection (oleObj / AlternateContent locks)
         with zipfile.ZipFile(output_path, "r") as z:
             slide_names = [n for n in z.namelist()
                            if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
-
         for slide_name in slide_names:
             with zipfile.ZipFile(output_path, "r") as z:
                 slide_xml = z.read(slide_name)
             slide_root = etree.fromstring(slide_xml)
-
-            # Remove mc:AlternateContent blocks that wrap locked OLE objects
             mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
             slide_changed = False
             for ac in slide_root.findall(f".//{{{mc_ns}}}AlternateContent"):
                 parent = ac.getparent()
                 if parent is not None:
-                    # Only remove if it wraps a locked oleObj
                     if b"oleObj" in etree.tostring(ac) and b"locked" in etree.tostring(ac):
                         parent.remove(ac)
                         slide_changed = True
-
             if slide_changed:
                 new_slide_xml = etree.tostring(slide_root, xml_declaration=True, encoding="UTF-8", standalone=True)
                 _rewrite_zip(output_path, slide_name, new_slide_xml)
-
     except ImportError:
         print("Missing dependency! Please run: pip install lxml")
         return 1
@@ -391,112 +312,65 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
         return 1
     finally:
         _cleanup(tmp_path)
-
     print(f"PowerPoint unprotected: {output_path}")
     return 0
 
-# Dispatch table
-
-# Maps extension -> (label, handler)
-# .xls / .doc / .ppt are actually intentionally kept so they get a clear error message :D
-# rather than an "unsupported file type" error.
 SUPPORTED: dict[str, tuple[str, Callable]] = {
     ".pdf":  ("PDF",        unprotect_pdf),
     ".xlsx": ("Excel",      unprotect_excel),
     ".xlsm": ("Excel",      unprotect_excel),
-    ".xls":  ("Excel",      unprotect_excel),   # will self-reject with a VERY helpful message (trust)
+    ".xls":  ("Excel",      unprotect_excel),
     ".docx": ("Word",       unprotect_word),
-    ".doc":  ("Word",       unprotect_word),    # will self-reject
+    ".doc":  ("Word",       unprotect_word),
     ".pptx": ("PowerPoint", unprotect_powerpoint),
-    ".ppt":  ("PowerPoint", unprotect_powerpoint),  # will self-reject
+    ".ppt":  ("PowerPoint", unprotect_powerpoint),
 }
 
-# Main
-
 def process_file(input_path: str, password: str | None, output_arg: str | None, in_place: bool, check_only: bool) -> int:
-    """Process a single file. Returns an exit code."""
-
     if not os.path.exists(input_path):
         print(f"Error: File not found: {input_path}")
         return 4
-
     ext = os.path.splitext(input_path)[1].lower()
     if ext not in SUPPORTED:
         supported_list = ", ".join(SUPPORTED.keys())
         print(f"Error: Unsupported file type '{ext}'. Supported: {supported_list}")
         return 3
-
     if check_only:
         check_protection(input_path, password)
         return 0
-
     label, handler = SUPPORTED[ext]
     output_path = _resolve_output(input_path, output_arg, in_place)
     _check_collision(input_path, output_path, in_place)
-
     print(f"Processing {label} file: {input_path}")
     return handler(input_path, password, output_path)
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Remove password protection from PDF and Office files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "files",
-        nargs="+",
-        help="Path(s) or glob pattern(s) to protected file(s)",
-    )
-    parser.add_argument(
-        "password",
-        nargs="?",
-        default=None,
-        help="Password to unlock the file (omit if there is no open password)",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default=None,
-        help="Output file path. Only valid when processing a single file. "
-             "Default: unlocked_<filename> next to the original.",
-    )
-    parser.add_argument(
-        "--in-place",
-        action="store_true",
-        help="Overwrite the original file instead of creating unlocked_<filename>.",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Dry-run: report protection status without modifying any files.",
-    )
+    parser = argparse.ArgumentParser(description="Remove password protection from PDF and Office files.")
+    parser.add_argument("files", nargs="+", help="Path(s) or glob pattern(s) to protected file(s)")
+    parser.add_argument("--password", "-p", default=None, help="Password to unlock the file (omit if there is no open password)")
+    parser.add_argument("--output", "-o", default=None)
+    parser.add_argument("--in-place", action="store_true")
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-
     if args.output and args.in_place:
         print("Error: --output and --in-place are mutually exclusive.")
         sys.exit(1)
-
-    # Expand globs
     input_paths: list[str] = []
     for pattern in args.files:
         expanded = glob.glob(pattern)
         if expanded:
             input_paths.extend(expanded)
         else:
-            input_paths.append(pattern)  # keep as-is so we get a "not found" error
-
-    # --output is only meaningful for a single file
+            input_paths.append(pattern)
     if args.output and len(input_paths) > 1:
         print("Error: --output can only be used when processing a single file.")
         sys.exit(1)
-
     exit_code = 0
     for path in input_paths:
-        code = process_file(input_path=path, password=args.password, output_arg=args.output, in_place=args.in_place, check_only=args.check,)
+        code = process_file(input_path=path, password=args.password, output_arg=args.output, in_place=args.in_place, check_only=args.check)
         if code != 0:
-            exit_code = code  # surface the last non-zero code
-
+            exit_code = code
     sys.exit(exit_code)
-
 
 if __name__ == "__main__":
     main()
