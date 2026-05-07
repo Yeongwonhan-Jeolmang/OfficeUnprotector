@@ -195,53 +195,87 @@ jobs:
           python unprotect.py --check inplace_test.pptx
 
       # ── Error handling & exit codes ──────────────────────────────────────────
+      # subprocess.run() is used throughout so a non-zero exit from unprotect.py
+      # doesn't kill the step before we can assert the code. Also works on Windows.
 
       - name: "[error] Wrong PDF password returns exit code 2"
         run: |
-          python unprotect.py test_userpw.pdf --password wrongpass
-          if [ $? -ne 2 ]; then echo "Expected exit code 2"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf", "--password", "wrongpass"])
+          assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] Missing password on encrypted PDF returns exit code 1"
         run: |
-          python unprotect.py test_userpw.pdf
-          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf"])
+          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] File not found returns exit code 4"
         run: |
-          python unprotect.py nonexistent.xlsx
-          if [ $? -ne 4 ]; then echo "Expected exit code 4"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "nonexistent.xlsx"])
+          assert r.returncode == 4, f"Expected exit code 4, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] Unsupported extension returns exit code 3"
         run: |
-          echo "dummy" > dummy.csv
-          python unprotect.py dummy.csv
-          if [ $? -ne 3 ]; then echo "Expected exit code 3"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          open("dummy.csv", "w").close()
+          r = subprocess.run([sys.executable, "unprotect.py", "dummy.csv"])
+          assert r.returncode == 3, f"Expected exit code 3, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] Legacy .xls rejected with exit code 1"
         run: |
-          echo "dummy" > dummy.xls
-          python unprotect.py dummy.xls
-          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          open("dummy.xls", "w").close()
+          r = subprocess.run([sys.executable, "unprotect.py", "dummy.xls"])
+          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] --output and --in-place are mutually exclusive"
         run: |
-          python unprotect.py test_plain.pdf --output out.pdf --in-place
-          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "--output", "out.pdf", "--in-place"])
+          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] --output with multiple files is rejected"
         run: |
-          python unprotect.py test_plain.pdf test_protected.xlsx --output out.pdf
-          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "test_protected.xlsx", "--output", "out.pdf"])
+          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
 
       - name: "[error] Input/output collision without --in-place is rejected"
         run: |
-          python unprotect.py test_plain.pdf --output test_plain.pdf
-          if [ $? -ne 1 ]; then echo "Expected exit code 1"; exit 1; fi
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "--output", "test_plain.pdf"])
+          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
+          print("OK")
+          EOF
         shell: bash
