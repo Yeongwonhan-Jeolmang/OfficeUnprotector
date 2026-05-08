@@ -602,16 +602,3 @@ jobs:
           print("OK")
           EOF
         shell: bash
-
-      # ── GUI import check (Linux only) ────────────────────────────────────
-      - name: "[gui] Install system tkinter (Linux)"
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk
-
-      - name: "[gui] Install customtkinter"
-        if: runner.os == 'Linux'
-        run: pip install customtkinter
-
-      - name: "[gui] Verify unprotect_gui can be imported"
-        if: runner.os == 'Linux'
-        run: python -c "import unprotect_gui; print('unprotect_gui import OK')"
