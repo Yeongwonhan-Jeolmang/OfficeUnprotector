@@ -1,1 +1,4 @@
 myenv/
+dist/
+build/
+*.egg-info/
