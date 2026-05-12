@@ -396,7 +396,7 @@ def _print_check_result(result: FileResult, use_json: bool, json_accumulator: li
 def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwargs) -> FileResult:
     try:
         from pypdf import PdfReader, PdfWriter
-        from pypdf.generic import ArrayObject
+        from pypdf.generic import ArrayObject, NameObject
     except ImportError:
         raise UnprotectError("Missing dependency: pip install pypdf")
 
@@ -454,7 +454,7 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
                 ]
             )
 
-            page["/Annots"] = filtered_annots
+            page[NameObject("/Annots")] = filtered_annots
 
             log.debug("  Removed redaction annotations")
 
@@ -788,7 +788,7 @@ Examples:
                     res = future.result()
                     results.append(res)
                 except Exception as e:
-                    results.append(FileResult(path=futures[future], status="failed", message=str(e)))
+                    results.append(FileResult(path=futures[future], status="failed", message=f"Error: {e}"))
                     if args.fail_fast:
                         for f in futures:
                             f.cancel()
@@ -825,7 +825,7 @@ Examples:
                     )
                 results.append(res)
             except UnprotectError as e:
-                results.append(FileResult(path=path, status="failed", message=str(e)))
+                results.append(FileResult(path=path, status="failed", message=f"Error: {e}"))
                 if args.fail_fast:
                     break
             except Exception as e:
