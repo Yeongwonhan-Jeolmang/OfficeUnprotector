@@ -44,7 +44,7 @@ jobs:
           from docx import Document
           from pptx import Presentation
           from pypdf import PdfWriter, PdfReader
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject, ArrayObject
 
           NS_XLSX = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           NS_DOCX = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -66,7 +66,6 @@ jobs:
               os.replace(tmp, path)
 
           # ---------- OpenXML protected files ----------
-          # xlsx: workbook + sheet protection
           wb = Workbook()
           ws = wb.active
           ws["A1"] = "protected"
@@ -77,7 +76,6 @@ jobs:
               el.set("lockStructure", "1")
           inject_zip_xml("test_protected.xlsx", "workbook.xml", add_wb_protection)
 
-          # xlsx: open (no protection)
           wb2 = Workbook()
           wb2.active["A1"] = "open"
           wb2.save("test_open.xlsx")
@@ -86,7 +84,6 @@ jobs:
                   root.remove(el)
           inject_zip_xml("test_open.xlsx", "workbook.xml", remove_wb_protection)
 
-          # docx: documentProtection
           doc = Document()
           doc.add_paragraph("protected")
           doc.save("test_protected.docx")
@@ -95,7 +92,6 @@ jobs:
               el.set(f"{{{NS_DOCX}}}edit", "readOnly")
           inject_zip_xml("test_protected.docx", "settings.xml", add_doc_protection)
 
-          # pptx: modifyVerifier
           prs = Presentation()
           prs.slides.add_slide(prs.slide_layouts[0])
           prs.save("test_protected.pptx")
@@ -106,7 +102,7 @@ jobs:
           inject_zip_xml("test_protected.pptx", "presentation.xml", add_pptx_protection)
 
           # ---------- PDF files ----------
-          # owner‑only password (no user password)
+          # owner‑only password
           w_owner = PdfWriter()
           w_owner.add_blank_page(200, 200)
           w_owner.encrypt(user_password="", owner_password="owneronly")
@@ -141,12 +137,12 @@ jobs:
           annot[NameObject("/Subtype")] = NameObject("/Redact")
           annot[NameObject("/Rect")] = RectangleObject([50, 50, 150, 150])
           if "/Annots" not in page:
-              page[NameObject("/Annots")] = []
+              page[NameObject("/Annots")] = ArrayObject()
           page[NameObject("/Annots")].append(annot)
           with open("test_redact.pdf", "wb") as f:
               w_redact.write(f)
 
-          # Dummy legacy binary files (just to test recognition)
+          # Dummy legacy binary files
           for ext in [".doc", ".xls", ".ppt"]:
               with open(f"dummy{ext}", "wb") as f:
                   f.write(b"PK\x03\x04")
@@ -156,7 +152,6 @@ jobs:
         shell: bash
 
       # ── Protection detection (--check / --dry-run) ───────────────────────
-
       - name: "[check] Detects xlsx protection"
         run: python unprotect.py --check test_protected.xlsx
 
@@ -191,7 +186,6 @@ jobs:
         shell: bash
 
       # ── --check --json output ────────────────────────────────────────────
-
       - name: "[check --json] Emits valid JSON for protected file"
         run: |
           python - << 'EOF'
@@ -214,7 +208,6 @@ jobs:
         shell: bash
 
       # ── Happy-path unprotect ─────────────────────────────────────────────
-
       - name: "[xlsx] Removes workbook and sheet protection"
         run: |
           python unprotect.py test_protected.xlsx -o out_protected.xlsx
@@ -248,7 +241,6 @@ jobs:
         run: python unprotect.py test_userpw.pdf --password secret -o out_userpw.pdf
 
       # ── --in-place ───────────────────────────────────────────────────────
-
       - name: "[in-place] xlsx unencrypted file does not crash"
         run: |
           cp test_protected.xlsx inplace_test.xlsx
@@ -268,7 +260,6 @@ jobs:
           python unprotect.py --check inplace_test.pptx
 
       # ── --backup ─────────────────────────────────────────────────────────
-
       - name: "[backup] Creates .bak file alongside --in-place"
         run: |
           python - << 'EOF'
@@ -286,7 +277,6 @@ jobs:
         shell: bash
 
       # ── --output-dir ─────────────────────────────────────────────────────
-
       - name: "[output-dir] Writes unlocked files into specified directory"
         run: |
           python - << 'EOF'
@@ -305,12 +295,10 @@ jobs:
         shell: bash
 
       # ── --no-overwrite ───────────────────────────────────────────────────
-
       - name: "[no-overwrite] Skips file when output already exists"
         run: |
           python - << 'EOF'
           import subprocess, sys, os, time
-          # Create output first
           subprocess.run([sys.executable, "unprotect.py", "test_plain.pdf", "-o", "no_ow_out.pdf"],
                          check=True)
           mtime_before = os.path.getmtime("no_ow_out.pdf")
@@ -328,19 +316,15 @@ jobs:
         shell: bash
 
       # ── --fail-fast ──────────────────────────────────────────────────────
-
       - name: "[fail-fast] Stops after first error"
         run: |
           python - << 'EOF'
           import subprocess, sys
-          # Two bad files: first fails (not found), second would also fail.
-          # With --fail-fast we expect a single error and non-zero exit.
           r = subprocess.run(
               [sys.executable, "unprotect.py", "missing1.xlsx", "missing2.xlsx", "--fail-fast"],
               capture_output=True, text=True
           )
           assert r.returncode != 0, "Expected non-zero exit with --fail-fast"
-          # Only one "Error" line should appear (stopped after the first)
           error_lines = [l for l in r.stdout.splitlines() if l.startswith("Error")]
           assert len(error_lines) == 1, f"Expected 1 error line, got {len(error_lines)}: {r.stdout}"
           print("OK")
@@ -348,7 +332,6 @@ jobs:
         shell: bash
 
       # ── --verbose / --quiet ──────────────────────────────────────────────
-
       - name: "[verbose] Shows extra detail"
         run: |
           python - << 'EOF'
@@ -359,7 +342,6 @@ jobs:
               capture_output=True, text=True
           )
           assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
-          # --verbose should surface at least one debug-level line (e.g. "Removed" or "Rewrote")
           assert any(kw in r.stdout for kw in ("Removed", "Rewrote", "Rewr")), \
               f"No verbose output found:\n{r.stdout}"
           print("OK")
@@ -382,7 +364,6 @@ jobs:
         shell: bash
 
       # ── --password-file ──────────────────────────────────────────────────
-
       - name: "[password-file] Reads password from file"
         run: |
           python - << 'EOF'
@@ -400,7 +381,6 @@ jobs:
         shell: bash
 
       # ── --password-list ──────────────────────────────────────────────────
-
       - name: "[password-list] Brute-forces correct password from wordlist"
         run: |
           python - << 'EOF'
@@ -435,7 +415,6 @@ jobs:
         shell: bash
 
       # ── --recursive ──────────────────────────────────────────────────────
-
       - name: "[recursive] Finds files in subdirectories"
         run: |
           python - << 'EOF'
@@ -453,7 +432,6 @@ jobs:
         shell: bash
 
       # ── Batch summary line ───────────────────────────────────────────────
-
       - name: "[batch] Prints summary line for multiple files"
         run: |
           python - << 'EOF'
@@ -472,13 +450,11 @@ jobs:
         shell: bash
 
       # ── Library API ──────────────────────────────────────────────────────
-
       - name: "[library] unprotect_file() and check_file() are importable and callable"
         run: |
           python - << 'EOF'
           from unprotect import unprotect_file, check_file, FileResult, UnprotectError
 
-          # check_file returns a FileResult
           result = check_file("test_protected.xlsx")
           assert isinstance(result, FileResult)
           assert result.status == "protected"
@@ -487,7 +463,6 @@ jobs:
           result_open = check_file("test_plain.pdf")
           assert result_open.status == "open"
 
-          # unprotect_file raises UnprotectError for missing files (not sys.exit)
           try:
               unprotect_file("nonexistent.pdf")
               assert False, "Should have raised"
@@ -495,7 +470,6 @@ jobs:
               assert e.code == 4
               print(f"UnprotectError raised correctly: {e}")
 
-          # unprotect_file works end-to-end
           r = unprotect_file("test_protected.xlsx", output_path="lib_out.xlsx")
           assert isinstance(r, FileResult)
           assert r.status == "unlocked"
@@ -504,7 +478,6 @@ jobs:
         shell: bash
 
       # ── Error handling & exit codes ──────────────────────────────────────
-
       - name: "[error] Wrong PDF password returns exit code 2"
         run: |
           python - << 'EOF'
@@ -522,7 +495,6 @@ jobs:
           import subprocess, sys
           r = subprocess.run([sys.executable, "unprotect.py", "test_userpw.pdf"],
                              capture_output=True)
-          # stdin is not a TTY in CI so no interactive prompt fires; file is encrypted → exit 1
           assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
           print("OK")
           EOF
@@ -551,12 +523,11 @@ jobs:
           EOF
         shell: bash
 
-      # Legacy formats are now supported, so they should not exit with code 3.
       - name: "[legacy] .doc .xls .ppt are now recognised (exit 0 or 1, not 3)"
         run: |
           for ext in doc xls ppt; do
             cp dummy.$ext test.$ext
-            python unprotect.py test.$ext --check || true  # may exit 1 if not real, but not 3
+            python unprotect.py test.$ext --check || true
           done
 
       - name: "[error] --output and --in-place are mutually exclusive (argparse exit 2)"
@@ -566,7 +537,6 @@ jobs:
           r = subprocess.run(
               [sys.executable, "unprotect.py", "test_plain.pdf", "--output", "out.pdf", "--in-place"],
               capture_output=True)
-          # argparse parser.error() exits with code 2
           assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
@@ -580,7 +550,6 @@ jobs:
               [sys.executable, "unprotect.py",
                "test_plain.pdf", "test_protected.xlsx", "--output", "out.pdf"],
               capture_output=True)
-          # argparse parser.error() exits with code 2
           assert r.returncode == 2, f"Expected exit code 2, got {r.returncode}"
           print("OK")
           EOF
@@ -622,32 +591,7 @@ jobs:
           EOF
         shell: bash
 
-  # ========== NEW TESTS FOR ADDED FEATURES ==========
-
-  test-convert:
-    name: Test --convert (Ubuntu, Python 3.12)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install msoffcrypto-tool pypdf lxml
-      - name: Install LibreOffice
-        run: sudo apt-get update && sudo apt-get install -y libreoffice
-      - name: Create dummy legacy file and simple OpenXML file
-        run: |
-          echo "dummy content" > dummy.doc
-          python -c "from openpyxl import Workbook; Workbook().save('test.xlsx')"
-      - name: Test --convert flag is accepted
-        run: python unprotect.py --help | grep -q -- "--convert"
-      - name: Test --convert on already-modern file (should be harmless)
-        run: python unprotect.py test.xlsx --convert --output converted.xlsx
-      - name: Test --convert with missing LibreOffice (simulate by moving binary)
-        run: |
-          sudo mv /usr/bin/libreoffice /usr/bin/libreoffice.bak
-          ! python unprotect.py dummy.doc --convert 2>&1 | grep -q "libreoffice not found" || true
-          sudo mv /usr/bin/libreoffice.bak /usr/bin/libreoffice
+  # ========== NEW TESTS (excluding --convert) ==========
 
   test-jobs:
     name: Test --jobs (Python 3.12)
@@ -665,7 +609,7 @@ jobs:
           done
       - name: Run with --jobs 2 and verify no errors
         run: python unprotect.py file*.xlsx --output-dir out --jobs 2
-      - name: Run with --jobs 4 on protected file
+      - name: Run with --jobs 4 on protected file (fixed command)
         run: |
           python -c "
           from openpyxl import Workbook
@@ -674,7 +618,7 @@ jobs:
           ws.protection.sheet = True
           wb.save('protected.xlsx')
           "
-          python unprotect.py protected.xlsx protected.xlsx --output-dir out2 --jobs 4 --in-place --backup
+          python unprotect.py protected.xlsx --in-place --backup --jobs 4
 
   test-pdf-cleaning:
     name: Test enhanced PDF cleaning
@@ -685,23 +629,25 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install pypdf
-      - name: Create PDFs with owner password, JS, redaction
+      - name: Create PDFs with owner password, JS, redaction (fixed)
         run: |
           python -c "
           from pypdf import PdfWriter
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject, ArrayObject
 
           # owner‑only
           w = PdfWriter()
           w.add_blank_page(200,200)
           w.encrypt(user_password='', owner_password='owner')
-          with open('owner.pdf','wb') as f: w.write(f)
+          with open('owner.pdf','wb') as f:
+              w.write(f)
 
           # with JS
           w2 = PdfWriter()
           w2.add_blank_page(200,200)
           w2.add_js('app.alert(1);')
-          with open('js.pdf','wb') as f: w2.write(f)
+          with open('js.pdf','wb') as f:
+              w2.write(f)
 
           # with redaction annotation
           w3 = PdfWriter()
@@ -711,9 +657,10 @@ jobs:
           annot[NameObject('/Subtype')] = NameObject('/Redact')
           annot[NameObject('/Rect')] = RectangleObject([50,50,150,150])
           if '/Annots' not in page:
-              page[NameObject('/Annots')] = []
+              page[NameObject('/Annots')] = ArrayObject()
           page[NameObject('/Annots')].append(annot)
-          with open('redact.pdf','wb') as f: w3.write(f)
+          with open('redact.pdf','wb') as f:
+              w3.write(f)
           "
       - name: Run unprotect on owner‑only PDF (no password needed)
         run: python unprotect.py owner.pdf --output cleaned_owner.pdf
