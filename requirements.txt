@@ -4,3 +4,5 @@
 msoffcrypto-tool>=5.0.0   # file-level Office encryption/decryption
 pypdf>=4.0.0              # PDF reading, decryption, and writing
 lxml>=4.9.0               # XML manipulation for Office ZIP internals
+customtkinter>=5.0.0      # modern GUI framework for the application
+CTkSpinbox>=0.1.0

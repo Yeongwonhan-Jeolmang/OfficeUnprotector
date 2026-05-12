@@ -43,7 +43,8 @@ jobs:
           from openpyxl import Workbook
           from docx import Document
           from pptx import Presentation
-          from pypdf import PdfWriter
+          from pypdf import PdfWriter, PdfReader
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
 
           NS_XLSX = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           NS_DOCX = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -64,26 +65,24 @@ jobs:
                       zout.writestr(item, data, compress_type=item.compress_type)
               os.replace(tmp, path)
 
+          # ---------- OpenXML protected files ----------
           # xlsx: workbook + sheet protection
           wb = Workbook()
           ws = wb.active
           ws["A1"] = "protected"
           ws.protection.sheet = True
           wb.save("test_protected.xlsx")
-
           def add_wb_protection(root):
               el = etree.SubElement(root, f"{{{NS_XLSX}}}workbookProtection")
               el.set("lockStructure", "1")
           inject_zip_xml("test_protected.xlsx", "workbook.xml", add_wb_protection)
 
-          # xlsx: no protection (for --check open detection)
+          # xlsx: open (no protection)
           wb2 = Workbook()
           wb2.active["A1"] = "open"
           wb2.save("test_open.xlsx")
-
           def remove_wb_protection(root):
-              ns_ = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-              for el in root.findall(f"{{{ns_}}}workbookProtection"):
+              for el in root.findall(f"{{{NS_XLSX}}}workbookProtection"):
                   root.remove(el)
           inject_zip_xml("test_open.xlsx", "workbook.xml", remove_wb_protection)
 
@@ -91,7 +90,6 @@ jobs:
           doc = Document()
           doc.add_paragraph("protected")
           doc.save("test_protected.docx")
-
           def add_doc_protection(root):
               el = etree.SubElement(root, f"{{{NS_DOCX}}}documentProtection")
               el.set(f"{{{NS_DOCX}}}edit", "readOnly")
@@ -101,49 +99,47 @@ jobs:
           prs = Presentation()
           prs.slides.add_slide(prs.slide_layouts[0])
           prs.save("test_protected.pptx")
-
           def add_pptx_protection(root):
               el = etree.SubElement(root, f"{{{NS_PPTX}}}modifyVerifier")
               el.set("algorithmName", "SHA-512")
               el.set("hashValue", "fakehash==")
           inject_zip_xml("test_protected.pptx", "presentation.xml", add_pptx_protection)
 
-          # pdf: owner-password-only (freely openable, editing restricted)
-          w = PdfWriter()
-          w.add_blank_page(200, 200)
-          w.encrypt(user_password="", owner_password="owneronly")
+          # ---------- PDF files ----------
+          # owner‑only password (no user password)
+          w_owner = PdfWriter()
+          w_owner.add_blank_page(200, 200)
+          w_owner.encrypt(user_password="", owner_password="owneronly")
           with open("test_owneronly.pdf", "wb") as f:
-              w.write(f)
+              w_owner.write(f)
 
-          # pdf: user+owner password
-          w2 = PdfWriter()
-          w2.add_blank_page(200, 200)
-          w2.encrypt(user_password="secret", owner_password="secret")
+          # user + owner password
+          w_user = PdfWriter()
+          w_user.add_blank_page(200, 200)
+          w_user.encrypt(user_password="secret", owner_password="secret")
           with open("test_userpw.pdf", "wb") as f:
-              w2.write(f)
+              w_user.write(f)
 
-          # plain unencrypted pdf
-          w3 = PdfWriter()
-          w3.add_blank_page(200, 200)
+          # plain unencrypted PDF
+          w_plain = PdfWriter()
+          w_plain.add_blank_page(200, 200)
           with open("test_plain.pdf", "wb") as f:
-              w3.write(f)
+              w_plain.write(f)
 
-          # PDF with JavaScript (for enhanced cleaning test)
+          # PDF with JavaScript
           w_js = PdfWriter()
           w_js.add_blank_page(200, 200)
           w_js.add_js("app.alert('test');")
           with open("test_with_js.pdf", "wb") as f:
               w_js.write(f)
 
-          # PDF with redaction annotation
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+          # PDF with redaction annotation (fixed)
           w_redact = PdfWriter()
           page = w_redact.add_blank_page(200, 200)
-          annot = DictionaryObject({
-              NameObject("/Type"): NameObject("/Annot"),
-              NameObject("/Subtype"): NameObject("/Redact"),
-              NameObject("/Rect"): RectangleObject([50, 50, 150, 150]),
-          })
+          annot = DictionaryObject()
+          annot[NameObject("/Type")] = NameObject("/Annot")
+          annot[NameObject("/Subtype")] = NameObject("/Redact")
+          annot[NameObject("/Rect")] = RectangleObject([50, 50, 150, 150])
           if "/Annots" not in page:
               page[NameObject("/Annots")] = []
           page[NameObject("/Annots")].append(annot)
@@ -626,7 +622,8 @@ jobs:
           EOF
         shell: bash
 
-  # --- Test --convert (requires LibreOffice, Ubuntu only) ---
+  # ========== NEW TESTS FOR ADDED FEATURES ==========
+
   test-convert:
     name: Test --convert (Ubuntu, Python 3.12)
     runs-on: ubuntu-latest
@@ -652,7 +649,6 @@ jobs:
           ! python unprotect.py dummy.doc --convert 2>&1 | grep -q "libreoffice not found" || true
           sudo mv /usr/bin/libreoffice.bak /usr/bin/libreoffice
 
-  # --- Test --jobs (parallel processing) ---
   test-jobs:
     name: Test --jobs (Python 3.12)
     runs-on: ubuntu-latest
@@ -680,7 +676,6 @@ jobs:
           "
           python unprotect.py protected.xlsx protected.xlsx --output-dir out2 --jobs 4 --in-place --backup
 
-  # --- Test enhanced PDF cleaning (owner password, JS, redactions) ---
   test-pdf-cleaning:
     name: Test enhanced PDF cleaning
     runs-on: ubuntu-latest
@@ -694,25 +689,27 @@ jobs:
         run: |
           python -c "
           from pypdf import PdfWriter
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+
           # owner‑only
           w = PdfWriter()
           w.add_blank_page(200,200)
           w.encrypt(user_password='', owner_password='owner')
           with open('owner.pdf','wb') as f: w.write(f)
+
           # with JS
           w2 = PdfWriter()
           w2.add_blank_page(200,200)
           w2.add_js('app.alert(1);')
           with open('js.pdf','wb') as f: w2.write(f)
-          # with redaction annotation (simplified)
+
+          # with redaction annotation
           w3 = PdfWriter()
           page = w3.add_blank_page(200,200)
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
-          annot = DictionaryObject({
-              NameObject('/Type'): NameObject('/Annot'),
-              NameObject('/Subtype'): NameObject('/Redact'),
-              NameObject('/Rect'): RectangleObject([50,50,150,150]),
-          })
+          annot = DictionaryObject()
+          annot[NameObject('/Type')] = NameObject('/Annot')
+          annot[NameObject('/Subtype')] = NameObject('/Redact')
+          annot[NameObject('/Rect')] = RectangleObject([50,50,150,150])
           if '/Annots' not in page:
               page[NameObject('/Annots')] = []
           page[NameObject('/Annots')].append(annot)
@@ -734,7 +731,6 @@ jobs:
           python -c "
           from pypdf import PdfReader
           r = PdfReader('cleaned_js.pdf')
-          # Check that JavaScript entry not present
           root = r.trailer.get('/Root', {})
           names = root.get('/Names', {})
           js = names.get('/JavaScript', None)

@@ -2,8 +2,8 @@
 """
 unprotect.py — Remove password protection from PDF and Office files.
 
-Can also be used as a library:
-    from unprotect import unprotect_file, check_file
+Enhanced version with legacy binary support, conversion, extra protection removal,
+metadata preservation, PDF cleaning, and parallel processing.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import argparse
 import subprocess
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,6 @@ def _resolve_output(
     base = os.path.basename(input_path)
     name, ext = os.path.splitext(base)
     if convert:
-        # Change extension to modern format
         new_ext = {'.doc': '.docx', '.xls': '.xlsx', '.ppt': '.pptx'}.get(ext, ext)
         base = name + new_ext
     if output_dir:
@@ -139,20 +138,18 @@ def _make_backup(path: str) -> str:
 
 
 def _convert_with_libreoffice(input_path: str, output_path: str) -> None:
-    """Convert file using LibreOffice (--convert)."""
     if not shutil.which("libreoffice"):
         raise UnprotectError(
             "libreoffice not found in PATH. Install LibreOffice to use --convert."
         )
     out_dir = os.path.dirname(output_path) or "."
-    out_ext = os.path.splitext(output_path)[1][1:]  # without dot
+    out_ext = os.path.splitext(output_path)[1][1:]
     cmd = [
         "libreoffice", "--headless", "--convert-to", out_ext,
         "--outdir", out_dir, input_path
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        # LibreOffice creates file with original basename + new extension
         converted_name = os.path.basename(input_path)
         name_no_ext = os.path.splitext(converted_name)[0]
         expected = os.path.join(out_dir, f"{name_no_ext}.{out_ext}")
@@ -163,6 +160,118 @@ def _convert_with_libreoffice(input_path: str, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# XML stripping helpers (previously imported – now defined here)
+# ---------------------------------------------------------------------------
+def _strip_excel_xml_protection(xlsx_path: str):
+    import lxml.etree as etree
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        names = z.namelist()
+        wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
+        wb_xml = z.read(wb_name) if wb_name else None
+        sheet_names = [n for n in names
+                       if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+
+    if wb_name and wb_xml is not None:
+        wb_root = etree.fromstring(wb_xml)
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        removed = [el for el in wb_root.findall(f"{{{ns}}}workbookProtection")]
+        for el in removed:
+            wb_root.remove(el)
+            log.debug("  Removed workbookProtection from %s", wb_name)
+        if removed:
+            new_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            _rewrite_zip(xlsx_path, wb_name, new_xml)
+
+    for sheet_name in sheet_names:
+        with zipfile.ZipFile(xlsx_path, "r") as z:
+            sheet_xml = z.read(sheet_name)
+        root = etree.fromstring(sheet_xml)
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        removed = [el for el in root.findall(f"{{{ns}}}sheetProtection")]
+        for el in removed:
+            root.remove(el)
+            log.debug("  Removed sheetProtection from %s", sheet_name)
+        if removed:
+            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            _rewrite_zip(xlsx_path, sheet_name, new_xml)
+
+
+def _strip_word_xml_protection(docx_path: str):
+    import lxml.etree as etree
+    with zipfile.ZipFile(docx_path, "r") as z:
+        settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
+        if settings_name is None:
+            return
+        settings_xml = z.read(settings_name)
+    root = etree.fromstring(settings_xml)
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    changed = False
+    for tag in ("documentProtection", "writeProtection", "readOnlyRecommended"):
+        for el in root.findall(f"{{{ns}}}{tag}"):
+            root.remove(el)
+            log.debug("  Removed %s from %s", tag, settings_name)
+            changed = True
+    if changed:
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        _rewrite_zip(docx_path, settings_name, new_xml)
+
+
+def _strip_pptx_protections(pptx_path: str):
+    import lxml.etree as etree
+    with zipfile.ZipFile(pptx_path, "r") as z:
+        names = z.namelist()
+        prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
+        if prs_name is None:
+            return
+        prs_xml = z.read(prs_name)
+    root = etree.fromstring(prs_xml)
+    ns_pml = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    changed = False
+    for tag in ("modifyVerifier", "writeProtection"):
+        for el in root.findall(f"{{{ns_pml}}}{tag}"):
+            root.remove(el)
+            log.debug("  Removed %s from %s", tag, prs_name)
+            changed = True
+    if changed:
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        _rewrite_zip(pptx_path, prs_name, new_xml)
+
+    # Remove locked OLE objects
+    with zipfile.ZipFile(pptx_path, "r") as z:
+        slide_names = [n for n in z.namelist()
+                       if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
+    for slide_name in slide_names:
+        with zipfile.ZipFile(pptx_path, "r") as z:
+            slide_xml = z.read(slide_name)
+        slide_root = etree.fromstring(slide_xml)
+        mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+        slide_changed = False
+        for ac in slide_root.findall(f".//{{{mc_ns}}}AlternateContent"):
+            parent = ac.getparent()
+            if parent is not None:
+                raw = etree.tostring(ac)
+                if b"oleObj" in raw and b"locked" in raw:
+                    parent.remove(ac)
+                    log.debug("  Removed locked AlternateContent from %s", slide_name)
+                    slide_changed = True
+        if slide_changed:
+            new_slide_xml = etree.tostring(slide_root, xml_declaration=True,
+                                          encoding="UTF-8", standalone=True)
+            _rewrite_zip(pptx_path, slide_name, new_slide_xml)
+
+
+def _remove_extra_protections_office(zip_path: str, file_type: str):
+    """Remove digital signatures, etc."""
+    # Delete signature parts
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
+        sig_entries = [n for n in names if "_xmlsignatures" in n or n.endswith("signatures.xml")]
+    for entry in sig_entries:
+        _rewrite_zip(zip_path, entry, b"")
+        log.debug("  Removed signature entry: %s", entry)
+
+
+# ---------------------------------------------------------------------------
 # Protection detection (extended)
 # ---------------------------------------------------------------------------
 def _detect_xml_layers(input_path: str, ext: str) -> list[str]:
@@ -170,7 +279,7 @@ def _detect_xml_layers(input_path: str, ext: str) -> list[str]:
     try:
         with zipfile.ZipFile(input_path, "r") as z:
             names = z.namelist()
-            import lxml.etree as etree # type: ignore
+            import lxml.etree as etree
 
             if ext in (".xlsx", ".xlsm"):
                 ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -205,7 +314,6 @@ def _detect_xml_layers(input_path: str, ext: str) -> list[str]:
                         if root.find(f"{{{ns}}}{tag}") is not None:
                             layers.append(tag)
 
-            # Digital signatures detection
             if any("signature" in name.lower() for name in names):
                 layers.append("digital signature")
     except Exception:
@@ -247,7 +355,7 @@ def check_file(input_path: str, password: str | None = None) -> FileResult:
 
     elif ext == ".pdf":
         try:
-            from pypdf import PdfReader # type: ignore
+            from pypdf import PdfReader
             reader = PdfReader(input_path)
             if reader.is_encrypted:
                 return FileResult(
@@ -285,37 +393,32 @@ def _print_check_result(result: FileResult, use_json: bool, json_accumulator: li
 # ---------------------------------------------------------------------------
 # Unprotect implementations (enhanced)
 # ---------------------------------------------------------------------------
-def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> FileResult:
+def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwargs) -> FileResult:
     try:
-        from pypdf import PdfReader, PdfWriter # type: ignore
+        from pypdf import PdfReader, PdfWriter
     except ImportError:
         raise UnprotectError("Missing dependency: pip install pypdf")
 
     reader = PdfReader(input_path)
     if reader.is_encrypted:
-        # Try given password; if fails, try empty for owner password
         success = reader.decrypt(password or "")
         if success == 0 and password:
-            # Maybe it's owner password? Try empty string (strips permissions)
             success = reader.decrypt("")
         if success == 0:
             raise UnprotectError("Wrong password (or file uses unsupported encryption)", code=2)
 
     writer = PdfWriter()
-    # Copy pages and metadata (preserve everything except encryption)
     writer.clone_reader_document_root(reader)
-    # Remove JavaScript actions
+    # Remove JavaScript
     if "/Names" in reader.trailer.get("/Root", {}):
         root = reader.trailer["/Root"]
         if "/Names" in root and "/JavaScript" in root["/Names"]:
             del root["/Names"]["/JavaScript"]
-    # Remove redaction annotations by not copying them (they are in pages)
-    # Remove form restrictions: delete /AcroForm or set /NeedAppearances
+    # Remove form restrictions
     if "/AcroForm" in reader.trailer.get("/Root", {}):
         del reader.trailer["/Root"]["/AcroForm"]
 
     for page in reader.pages:
-        # Optionally remove redaction annotations from page
         if "/Annots" in page:
             page["/Annots"] = [a for a in page["/Annots"] if a.get("/Subtype") != "/Redact"]
         writer.add_page(page)
@@ -326,38 +429,8 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str) -> Fi
     return FileResult(path=output_path, status="unlocked", message=f"PDF cleaned → {output_path}")
 
 
-def _remove_extra_protections_office(zip_path: str, file_type: str):
-    """Remove digital signatures, read-only recommended, etc. from OpenXML."""
-    import lxml.etree as etree # type: ignore
-    # Remove signature parts
-    with zipfile.ZipFile(zip_path, "r") as z:
-        names = z.namelist()
-        sig_entries = [n for n in names if "_xmlsignatures" in n or n.endswith("signatures.xml")]
-    for entry in sig_entries:
-        _rewrite_zip(zip_path, entry, b"")  # empty content effectively deletes
-        log.debug("  Removed signature entry: %s", entry)
-
-    if file_type == "word":
-        # Remove readOnlyRecommended from settings.xml
-        with zipfile.ZipFile(zip_path, "r") as z:
-            settings_name = next((n for n in names if n.endswith("settings.xml")), None)
-            if settings_name:
-                xml = z.read(settings_name)
-                root = etree.fromstring(xml)
-                ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-                for ro in root.findall(f"{{{ns}}}readOnlyRecommended"):
-                    ro.getparent().remove(ro)
-                    log.debug("  Removed readOnlyRecommended")
-                new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-                _rewrite_zip(zip_path, settings_name, new_xml)
-
-    # Add similar for Excel (lockStructure already handled in _strip_excel_xml_protection)
-
-
-def unprotect_excel(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_excel(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".xls" and not convert:
-        warnings.warn("Legacy .xls format: restrictions cannot be removed without --convert. Only decryption will be performed.")
     tmp_path = output_path + ".tmp.xlsx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
@@ -365,8 +438,6 @@ def unprotect_excel(input_path: str, password: str | None, output_path: str, con
         if os.path.realpath(work_path) != os.path.realpath(output_path):
             shutil.copy2(work_path, output_path)
         if ext in (".xlsx", ".xlsm") or (convert and ext == ".xls"):
-            # Strip XML protections
-            from .unprotect import _strip_excel_xml_protection  # local import to avoid circular
             _strip_excel_xml_protection(output_path)
             _remove_extra_protections_office(output_path, "excel")
         if convert and ext == ".xls":
@@ -379,10 +450,8 @@ def unprotect_excel(input_path: str, password: str | None, output_path: str, con
     return FileResult(path=output_path, status="unlocked", message=f"Excel unprotected → {output_path}")
 
 
-def unprotect_word(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_word(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".doc" and not convert:
-        warnings.warn("Legacy .doc format: restrictions cannot be removed without --convert.")
     tmp_path = output_path + ".tmp.docx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
@@ -390,7 +459,6 @@ def unprotect_word(input_path: str, password: str | None, output_path: str, conv
         if os.path.realpath(work_path) != os.path.realpath(output_path):
             shutil.copy2(work_path, output_path)
         if ext == ".docx" or (convert and ext == ".doc"):
-            from .unprotect import _strip_word_xml_protection  # assume similar function exists
             _strip_word_xml_protection(output_path)
             _remove_extra_protections_office(output_path, "word")
         if convert and ext == ".doc":
@@ -402,10 +470,8 @@ def unprotect_word(input_path: str, password: str | None, output_path: str, conv
     return FileResult(path=output_path, status="unlocked", message=f"Word unprotected → {output_path}")
 
 
-def unprotect_powerpoint(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_powerpoint(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".ppt" and not convert:
-        warnings.warn("Legacy .ppt format: restrictions cannot be removed without --convert.")
     tmp_path = output_path + ".tmp.pptx"
     try:
         was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
@@ -413,7 +479,6 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
         if os.path.realpath(work_path) != os.path.realpath(output_path):
             shutil.copy2(work_path, output_path)
         if ext == ".pptx" or (convert and ext == ".ppt"):
-            from .unprotect import _strip_pptx_protections
             _strip_pptx_protections(output_path)
             _remove_extra_protections_office(output_path, "powerpoint")
         if convert and ext == ".ppt":
@@ -425,16 +490,15 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
     return FileResult(path=output_path, status="unlocked", message=f"PowerPoint unprotected → {output_path}")
 
 
-# Legacy binary handlers (no XML stripping)
-def unprotect_doc(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_doc(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     return unprotect_word(input_path, password, output_path, convert)
 
 
-def unprotect_xls(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_xls(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     return unprotect_excel(input_path, password, output_path, convert)
 
 
-def unprotect_ppt(input_path: str, password: str | None, output_path: str, convert: bool = False) -> FileResult:
+def unprotect_ppt(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     return unprotect_powerpoint(input_path, password, output_path, convert)
 
 
@@ -454,7 +518,7 @@ SUPPORTED: dict[str, tuple[str, Callable]] = {
 
 
 # ---------------------------------------------------------------------------
-# Public library API (extended with convert flag)
+# Public library API
 # ---------------------------------------------------------------------------
 def unprotect_file(
     input_path: str,
@@ -484,12 +548,11 @@ def unprotect_file(
         _make_backup(input_path)
 
     log.debug("Processing %s: %s → %s", label, input_path, resolved_output)
-    # Pass convert flag to handler (all handlers now accept it)
     return handler(input_path, password, resolved_output, convert=convert)
 
 
 # ---------------------------------------------------------------------------
-# Password helpers (unchanged)
+# Password helpers
 # ---------------------------------------------------------------------------
 def _load_password_file(path: str) -> str:
     with open(path, "r") as f:
@@ -535,7 +598,7 @@ def _try_password_list(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point with parallel processing
+# Parallel worker and CLI entry point
 # ---------------------------------------------------------------------------
 def _expand_paths(patterns: list[str], recursive: bool) -> list[str]:
     paths = []
@@ -560,7 +623,7 @@ def _process_one(args_tuple):
     path, cli_args, password, convert = args_tuple
     # Recreate logger for worker (avoid duplicate handlers)
     worker_log = logging.getLogger(f"unprotect.{os.getpid()}")
-    worker_log.setLevel(logging.WARNING)  # silence per-worker logs
+    worker_log.setLevel(logging.WARNING)
     try:
         if cli_args.check:
             result = check_file(path, password)
@@ -686,7 +749,6 @@ Examples:
                         for f in futures:
                             f.cancel()
                         break
-        # Restore original order for output
         ordered = {res.path: res for res in results}
         results = [ordered[p] for p in input_paths if p in ordered]
     else:
@@ -727,7 +789,6 @@ Examples:
                 if args.fail_fast:
                     break
 
-    # Output results
     json_results = []
     counts = {"unlocked": 0, "open": 0, "skipped": 0, "failed": 0}
     exit_code = 0
