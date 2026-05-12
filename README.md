@@ -28,12 +28,12 @@
 
 | Format | Extensions | What gets removed |
 |---|---|---|
-| PDF | `.pdf` | Open password / encryption |
-| Word | `.docx` | Open password + `documentProtection` / `writeProtection` |
-| Excel | `.xlsx` `.xlsm` | Open password + sheet and workbook protection |
-| PowerPoint | `.pptx` | Open password + `modifyVerifier` / `writeProtection` + locked OLE objects per-slide |
+| PDF | `.pdf` | Open password / encryption, redaction annotations, JavaScript actions, form restrictions |
+| Word | `.docx` `.doc`* | Open password + `documentProtection` / `writeProtection` / `readOnlyRecommended` + digital signatures |
+| Excel | `.xlsx` `.xlsm` `.xls`* | Open password + sheet and workbook protection + digital signatures |
+| PowerPoint | `.pptx` `.ppt`* | Open password + `modifyVerifier` / `writeProtection` + locked OLE objects per-slide + digital signatures |
 
-> **Legacy formats** (`.doc`, `.xls`, `.ppt`) are not supported. Open the file in LibreOffice or Microsoft Office, save it as the modern format, then retry.
+> **\* Legacy formats** (`.doc`, `.xls`, `.ppt`) support decryption and can optionally be converted to modern OpenXML format using `--convert` (requires LibreOffice). Without `--convert`, only file-level decryption is performed — XML edit locks cannot be stripped from legacy binary formats.
 
 ---
 
@@ -43,6 +43,12 @@ Python 3.10+ and the following packages:
 
 ```bash
 pip install pypdf msoffcrypto-tool lxml
+```
+
+For legacy format conversion (`--convert`):
+
+```bash
+# Install LibreOffice and ensure it is available in PATH
 ```
 
 ---
@@ -85,6 +91,18 @@ If none of these are given and the file turns out to be encrypted, you'll be pro
 |---|---|
 | `--check`, `--dry-run` | Report protection status without modifying any files |
 | `--json` | With `--check`: emit machine-readable JSON instead of human-readable text |
+
+### Legacy format conversion
+
+| Flag | Description |
+|---|---|
+| `--convert` | Convert legacy binary formats (`.doc`, `.xls`, `.ppt`) to modern OpenXML after decryption (requires LibreOffice). Cannot be combined with `--check`. |
+
+### Parallel processing
+
+| Flag | Description |
+|---|---|
+| `--jobs N`, `-j N` | Number of parallel worker processes (default: `1`). Use with large batch jobs to speed up processing. |
 
 ### Directory walking
 
@@ -158,6 +176,18 @@ python unprotect.py "*.pdf" -p mypassword --output-dir ./out/ --quiet
 
 # Stop on first failure (CI pipelines)
 python unprotect.py "*.xlsx" --output-dir ./out/ --fail-fast
+
+# Convert legacy .xls files to .xlsx and strip protections (requires LibreOffice)
+python unprotect.py "*.xls" --convert --output-dir ./unlocked/
+
+# Convert legacy .doc/.ppt files recursively
+python unprotect.py "**/*.doc" --recursive --convert --in-place --backup
+
+# Brute-force a legacy file and convert it in one step
+python unprotect.py locked.xls --password-list words.txt --convert
+
+# Speed up a large batch with parallel workers
+python unprotect.py "**/*.xlsx" --recursive --output-dir ./out/ --jobs 4
 ```
 
 When processing more than one file, a summary is printed at the end:
@@ -202,9 +232,13 @@ Modern Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives containing XML.
 
 **Layer 1 — file encryption** (password required to open): handled by `msoffcrypto-tool`, which decrypts the file into a temporary copy before any further processing.
 
-**Layer 2 — edit/structure protection** (file opens fine, but editing is locked): handled by direct XML manipulation via `lxml`. The relevant protection elements are removed from the XML inside the ZIP, rewriting only those entries while preserving compression and metadata for everything else.
+**Layer 2 — edit/structure protection** (file opens fine, but editing is locked): handled by direct XML manipulation via `lxml`. The relevant protection elements (`documentProtection`, `writeProtection`, `readOnlyRecommended`, `workbookProtection`, `sheetProtection`, `modifyVerifier`) are removed from the XML inside the ZIP, rewriting only those entries while preserving compression and metadata for everything else. Digital signature entries are also removed where detected.
 
-For PDFs, `pypdf` handles both decryption and reconstruction. PDFs with only an owner password (print/edit restrictions, but no open password) are unlocked automatically without needing `--password`.
+For PDFs, `pypdf` handles decryption, reconstruction, removal of redaction annotations, JavaScript actions, and form restrictions. PDFs with only an owner password (print/edit restrictions, but no open password) are unlocked automatically without needing `--password`.
+
+**Legacy formats** (`.doc`, `.xls`, `.ppt`) are binary formats that do not contain XML. File-level decryption is supported via `msoffcrypto-tool`. To also strip edit locks, use `--convert` to have LibreOffice convert the file to the equivalent modern format first.
+
+**Parallel processing**: when `--jobs N` is specified (N > 1), files are processed concurrently using a `ProcessPoolExecutor`. Results are collected and printed in the original input order.
 
 ---
 
@@ -230,6 +264,7 @@ try:
         output_dir=None,
         backup=False,
         no_overwrite=False,
+        convert=False,           # set True to convert legacy formats via LibreOffice
     )
     # result.status → "unlocked" | "skipped"
 except UnprotectError as e:
@@ -258,7 +293,13 @@ except UnprotectError as e:
 
 **`Error: PDF is encrypted and requires a password`** — pass the open password with `--password` / `-p`
 
-**`Unsupported file type`** — only `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.pptx` are supported; convert legacy formats first
+**`Unsupported file type`** — only `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.doc`, `.xls`, `.ppt` are supported
+
+**Legacy format edit locks not removed** — use `--convert` (requires LibreOffice); without it, only file-level decryption is performed on `.doc` / `.xls` / `.ppt` files
+
+**`libreoffice not found in PATH`** — install LibreOffice and ensure the `libreoffice` binary is accessible in your shell's PATH before using `--convert`
+
+**`--convert` rejected with `--check`** — conversion cannot be performed in dry-run mode; remove `--check` to proceed
 
 **`--output` rejected with multiple files** — `--output` only works for a single file; use `--output-dir` for batch jobs or omit it to get the default `unlocked_<filename>` naming
 

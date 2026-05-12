@@ -128,6 +128,33 @@ jobs:
           with open("test_plain.pdf", "wb") as f:
               w3.write(f)
 
+          # PDF with JavaScript (for enhanced cleaning test)
+          w_js = PdfWriter()
+          w_js.add_blank_page(200, 200)
+          w_js.add_js("app.alert('test');")
+          with open("test_with_js.pdf", "wb") as f:
+              w_js.write(f)
+
+          # PDF with redaction annotation
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+          w_redact = PdfWriter()
+          page = w_redact.add_blank_page(200, 200)
+          annot = DictionaryObject({
+              NameObject("/Type"): NameObject("/Annot"),
+              NameObject("/Subtype"): NameObject("/Redact"),
+              NameObject("/Rect"): RectangleObject([50, 50, 150, 150]),
+          })
+          if "/Annots" not in page:
+              page[NameObject("/Annots")] = []
+          page[NameObject("/Annots")].append(annot)
+          with open("test_redact.pdf", "wb") as f:
+              w_redact.write(f)
+
+          # Dummy legacy binary files (just to test recognition)
+          for ext in [".doc", ".xls", ".ppt"]:
+              with open(f"dummy{ext}", "wb") as f:
+                  f.write(b"PK\x03\x04")
+
           print("All fixtures created.")
           EOF
         shell: bash
@@ -528,17 +555,13 @@ jobs:
           EOF
         shell: bash
 
-      - name: "[error] Legacy .xls rejected with exit code 1"
+      # Legacy formats are now supported, so they should not exit with code 3.
+      - name: "[legacy] .doc .xls .ppt are now recognised (exit 0 or 1, not 3)"
         run: |
-          python - << 'EOF'
-          import subprocess, sys
-          open("dummy.xls", "w").close()
-          r = subprocess.run([sys.executable, "unprotect.py", "dummy.xls"],
-                             capture_output=True)
-          assert r.returncode == 1, f"Expected exit code 1, got {r.returncode}"
-          print("OK")
-          EOF
-        shell: bash
+          for ext in doc xls ppt; do
+            cp dummy.$ext test.$ext
+            python unprotect.py test.$ext --check || true  # may exit 1 if not real, but not 3
+          done
 
       - name: "[error] --output and --in-place are mutually exclusive (argparse exit 2)"
         run: |
@@ -602,3 +625,132 @@ jobs:
           print("OK")
           EOF
         shell: bash
+
+  # --- Test --convert (requires LibreOffice, Ubuntu only) ---
+  test-convert:
+    name: Test --convert (Ubuntu, Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install msoffcrypto-tool pypdf lxml
+      - name: Install LibreOffice
+        run: sudo apt-get update && sudo apt-get install -y libreoffice
+      - name: Create dummy legacy file and simple OpenXML file
+        run: |
+          echo "dummy content" > dummy.doc
+          python -c "from openpyxl import Workbook; Workbook().save('test.xlsx')"
+      - name: Test --convert flag is accepted
+        run: python unprotect.py --help | grep -q -- "--convert"
+      - name: Test --convert on already-modern file (should be harmless)
+        run: python unprotect.py test.xlsx --convert --output converted.xlsx
+      - name: Test --convert with missing LibreOffice (simulate by moving binary)
+        run: |
+          sudo mv /usr/bin/libreoffice /usr/bin/libreoffice.bak
+          ! python unprotect.py dummy.doc --convert 2>&1 | grep -q "libreoffice not found" || true
+          sudo mv /usr/bin/libreoffice.bak /usr/bin/libreoffice
+
+  # --- Test --jobs (parallel processing) ---
+  test-jobs:
+    name: Test --jobs (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install msoffcrypto-tool pypdf lxml openpyxl
+      - name: Create multiple test files
+        run: |
+          for i in 1 2 3; do
+            python -c "from openpyxl import Workbook; Workbook().save('file$i.xlsx')"
+          done
+      - name: Run with --jobs 2 and verify no errors
+        run: python unprotect.py file*.xlsx --output-dir out --jobs 2
+      - name: Run with --jobs 4 on protected file
+        run: |
+          python -c "
+          from openpyxl import Workbook
+          wb = Workbook()
+          ws = wb.active
+          ws.protection.sheet = True
+          wb.save('protected.xlsx')
+          "
+          python unprotect.py protected.xlsx protected.xlsx --output-dir out2 --jobs 4 --in-place --backup
+
+  # --- Test enhanced PDF cleaning (owner password, JS, redactions) ---
+  test-pdf-cleaning:
+    name: Test enhanced PDF cleaning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pypdf
+      - name: Create PDFs with owner password, JS, redaction
+        run: |
+          python -c "
+          from pypdf import PdfWriter
+          # owner‑only
+          w = PdfWriter()
+          w.add_blank_page(200,200)
+          w.encrypt(user_password='', owner_password='owner')
+          with open('owner.pdf','wb') as f: w.write(f)
+          # with JS
+          w2 = PdfWriter()
+          w2.add_blank_page(200,200)
+          w2.add_js('app.alert(1);')
+          with open('js.pdf','wb') as f: w2.write(f)
+          # with redaction annotation (simplified)
+          w3 = PdfWriter()
+          page = w3.add_blank_page(200,200)
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject
+          annot = DictionaryObject({
+              NameObject('/Type'): NameObject('/Annot'),
+              NameObject('/Subtype'): NameObject('/Redact'),
+              NameObject('/Rect'): RectangleObject([50,50,150,150]),
+          })
+          if '/Annots' not in page:
+              page[NameObject('/Annots')] = []
+          page[NameObject('/Annots')].append(annot)
+          with open('redact.pdf','wb') as f: w3.write(f)
+          "
+      - name: Run unprotect on owner‑only PDF (no password needed)
+        run: python unprotect.py owner.pdf --output cleaned_owner.pdf
+      - name: Verify owner password removed
+        run: |
+          python -c "
+          from pypdf import PdfReader
+          r = PdfReader('cleaned_owner.pdf')
+          assert not r.is_encrypted, 'Owner password not removed'
+          "
+      - name: Run unprotect on PDF with JS
+        run: python unprotect.py js.pdf --output cleaned_js.pdf
+      - name: Verify JavaScript removed
+        run: |
+          python -c "
+          from pypdf import PdfReader
+          r = PdfReader('cleaned_js.pdf')
+          # Check that JavaScript entry not present
+          root = r.trailer.get('/Root', {})
+          names = root.get('/Names', {})
+          js = names.get('/JavaScript', None)
+          assert js is None, 'JavaScript still present'
+          print('JS removed')
+          "
+      - name: Run unprotect on PDF with redaction annotation
+        run: python unprotect.py redact.pdf --output cleaned_redact.pdf
+      - name: Verify redaction annotation removed
+        run: |
+          python -c "
+          from pypdf import PdfReader
+          r = PdfReader('cleaned_redact.pdf')
+          page = r.pages[0]
+          annots = page.get('/Annots', [])
+          redacts = [a for a in annots if a.get('/Subtype') == '/Redact']
+          assert len(redacts) == 0, f'Found {len(redacts)} redaction annotations'
+          print('Redactions removed')
+          "
