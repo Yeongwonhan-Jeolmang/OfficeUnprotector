@@ -41,6 +41,7 @@ class FileResult:
     status: str                      # "unlocked" | "open" | "protected" | "failed" | "skipped"
     message: str = ""
     layers: list[str] = field(default_factory=list)
+    error_code: int = 0              # optional, for failure details
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +65,7 @@ def _msoffcrypto_decrypt(input_path: str, password: str, tmp_path: str) -> bool:
             return False
         if not password:
             raise UnprotectError(
-                "File is encrypted but no password provided.", code=2
+                "File is encrypted but no password provided.", code=1
             )
         try:
             office_file.load_key(password=password)
@@ -418,17 +419,15 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
 
     # Handle encrypted PDFs
     if reader.is_encrypted:
-        success = reader.decrypt(password or "")
-
-        # Retry empty password for owner-only encryption
-        if success == 0 and password:
-            success = reader.decrypt("")
-
+        # First try empty password (owner-only PDFs)
+        success = reader.decrypt("")
         if success == 0:
-            raise UnprotectError(
-                "Wrong password (or file uses unsupported encryption)",
-                code=2,
-            )
+            # Empty didn't work -> need a password
+            if not password:
+                raise UnprotectError("File is encrypted but no password provided.", code=1)
+            success = reader.decrypt(password)
+            if success == 0:
+                raise UnprotectError("Wrong password.", code=2)
 
     writer = PdfWriter()
 
@@ -575,7 +574,7 @@ def unprotect_powerpoint(input_path: str, password: str | None, output_path: str
     )
 
 
-# Aliases for legacy formats (they just reuse the above logic with convert flag)
+# Aliases for legacy formats
 def unprotect_doc(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     return unprotect_word(input_path, password, output_path, convert)
 
@@ -589,7 +588,7 @@ def unprotect_ppt(input_path: str, password: str | None, output_path: str, conve
 
 
 # ---------------------------------------------------------------------------
-# Supported format registry (extended)
+# Supported format registry
 # ---------------------------------------------------------------------------
 SUPPORTED: dict[str, tuple[str, Callable]] = {
     ".pdf":  ("PDF",        unprotect_pdf),
@@ -739,9 +738,9 @@ def _process_one(args_tuple):
             )
             return result
     except UnprotectError as e:
-        return FileResult(path=path, status="failed", message=str(e))
+        return FileResult(path=path, status="failed", message=str(e), error_code=e.code)
     except Exception as e:
-        return FileResult(path=path, status="failed", message=f"Unexpected: {e}")
+        return FileResult(path=path, status="failed", message=f"Unexpected: {e}", error_code=1)
 
 
 def main(argv: list[str] | None = None):
@@ -830,7 +829,7 @@ Examples:
                     res = future.result()
                     results.append(res)
                 except Exception as e:
-                    results.append(FileResult(path=futures[future], status="failed", message=f"Error: {e}"))
+                    results.append(FileResult(path=futures[future], status="failed", message=f"Error: {e}", error_code=1))
                     if args.fail_fast:
                         for f in futures:
                             f.cancel()
@@ -867,11 +866,16 @@ Examples:
                     )
                 results.append(res)
             except UnprotectError as e:
-                results.append(FileResult(path=path, status="failed", message=f"Error: {e}"))
-                if args.fail_fast:
-                    break
+                # For single file, exit with the specific error code
+                if len(input_paths) == 1:
+                    log.error(str(e))
+                    sys.exit(e.code)
+                else:
+                    results.append(FileResult(path=path, status="failed", message=f"Error: {e}", error_code=e.code))
+                    if args.fail_fast:
+                        break
             except Exception as e:
-                results.append(FileResult(path=path, status="failed", message=f"Unexpected: {e}"))
+                results.append(FileResult(path=path, status="failed", message=f"Unexpected: {e}", error_code=1))
                 if args.fail_fast:
                     break
 
@@ -887,8 +891,9 @@ Examples:
             else:
                 log.info("%s", res.message)
         counts[res.status if res.status in counts else "failed"] += 1
+        # If any failure, use the highest error code among failures (or just 1)
         if res.status == "failed":
-            exit_code = 1
+            exit_code = max(exit_code, res.error_code) if res.error_code else 1
 
     if args.json_output:
         print(json.dumps(json_results, indent=2))
