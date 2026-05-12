@@ -18,7 +18,6 @@ import sys
 import zipfile
 import argparse
 import subprocess
-import warnings
 from dataclasses import dataclass, field
 from typing import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -160,10 +159,14 @@ def _convert_with_libreoffice(input_path: str, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# XML stripping helpers (previously imported – now defined here)
+# XML stripping helpers
 # ---------------------------------------------------------------------------
 def _strip_excel_xml_protection(xlsx_path: str):
-    import lxml.etree as etree
+    try:
+        import lxml.etree as etree
+    except ImportError:
+        log.warning("lxml not installed, cannot strip Excel XML protections")
+        return
     with zipfile.ZipFile(xlsx_path, "r") as z:
         names = z.namelist()
         wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
@@ -197,7 +200,11 @@ def _strip_excel_xml_protection(xlsx_path: str):
 
 
 def _strip_word_xml_protection(docx_path: str):
-    import lxml.etree as etree
+    try:
+        import lxml.etree as etree
+    except ImportError:
+        log.warning("lxml not installed, cannot strip Word XML protections")
+        return
     with zipfile.ZipFile(docx_path, "r") as z:
         settings_name = next((n for n in z.namelist() if n.endswith("settings.xml")), None)
         if settings_name is None:
@@ -217,7 +224,11 @@ def _strip_word_xml_protection(docx_path: str):
 
 
 def _strip_pptx_protections(pptx_path: str):
-    import lxml.etree as etree
+    try:
+        import lxml.etree as etree
+    except ImportError:
+        log.warning("lxml not installed, cannot strip PowerPoint XML protections")
+        return
     with zipfile.ZipFile(pptx_path, "r") as z:
         names = z.namelist()
         prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
@@ -262,7 +273,6 @@ def _strip_pptx_protections(pptx_path: str):
 
 def _remove_extra_protections_office(zip_path: str, file_type: str):
     """Remove digital signatures, etc."""
-    # Delete signature parts
     with zipfile.ZipFile(zip_path, "r") as z:
         names = z.namelist()
         sig_entries = [n for n in names if "_xmlsignatures" in n or n.endswith("signatures.xml")]
@@ -277,9 +287,13 @@ def _remove_extra_protections_office(zip_path: str, file_type: str):
 def _detect_xml_layers(input_path: str, ext: str) -> list[str]:
     layers = []
     try:
+        import lxml.etree as etree
+    except ImportError:
+        return layers  # cannot detect without lxml
+
+    try:
         with zipfile.ZipFile(input_path, "r") as z:
             names = z.namelist()
-            import lxml.etree as etree
 
             if ext in (".xlsx", ".xlsm"):
                 ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -391,7 +405,7 @@ def _print_check_result(result: FileResult, use_json: bool, json_accumulator: li
 
 
 # ---------------------------------------------------------------------------
-# Unprotect implementations (enhanced)
+# Unprotect implementations (enhanced & fixed)
 # ---------------------------------------------------------------------------
 def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwargs) -> FileResult:
     try:
@@ -417,33 +431,8 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
             )
 
     writer = PdfWriter()
-    writer.clone_reader_document_root(reader)
 
-    # ------------------------------------------------------------------
-    # Remove JavaScript and form restrictions from WRITER root
-    # ------------------------------------------------------------------
-    root = writer._root_object
-
-    # Remove JavaScript
-    if "/Names" in root:
-        names = root["/Names"]
-
-        if "/JavaScript" in names:
-            del names["/JavaScript"]
-            log.debug("  Removed embedded JavaScript")
-
-        # Remove empty Names dictionary
-        if len(names) == 0:
-            del root["/Names"]
-
-    # Remove AcroForm restrictions/forms
-    if "/AcroForm" in root:
-        del root["/AcroForm"]
-        log.debug("  Removed AcroForm")
-
-    # ------------------------------------------------------------------
-    # Remove redaction annotations
-    # ------------------------------------------------------------------
+    # Add pages, removing redaction annotations on the fly
     for page in reader.pages:
         if "/Annots" in page:
             filtered_annots = ArrayObject(
@@ -453,16 +442,28 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
                     if annot.get("/Subtype") != "/Redact"
                 ]
             )
-
             page[NameObject("/Annots")] = filtered_annots
-
             log.debug("  Removed redaction annotations")
-
         writer.add_page(page)
 
-    # ------------------------------------------------------------------
+    # Remove JavaScript and form restrictions from writer root
+    root = writer._root_object
+
+    # Remove JavaScript
+    if "/Names" in root:
+        names = root["/Names"]
+        if "/JavaScript" in names:
+            del names["/JavaScript"]
+            log.debug("  Removed embedded JavaScript")
+        if len(names) == 0:
+            del root["/Names"]
+
+    # Remove AcroForm
+    if "/AcroForm" in root:
+        del root["/AcroForm"]
+        log.debug("  Removed AcroForm")
+
     # Write cleaned PDF
-    # ------------------------------------------------------------------
     with open(output_path, "wb") as f:
         writer.write(f)
 
@@ -473,67 +474,108 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
     )
 
 
+def _handle_office_common(
+    input_path: str,
+    password: str | None,
+    output_path: str,
+    convert: bool,
+    is_legacy: bool,
+    strip_func: Callable,
+    new_ext: str,
+    log_label: str,
+) -> FileResult:
+    """
+    Common logic for Excel, Word, PowerPoint.
+    - If legacy and convert: decrypt (if needed) -> convert -> strip -> move.
+    - If legacy and not convert: decrypt (if needed) -> copy (no stripping).
+    - If OpenXML: decrypt (if needed) -> copy -> strip.
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    tmp_decrypted = None
+    tmp_converted = None
+
+    try:
+        if is_legacy and convert:
+            # --- Legacy to OpenXML conversion ---
+            # Step 1: decrypt to a temporary legacy file (if encrypted)
+            tmp_legacy = output_path + ".legacy"
+            was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_legacy)
+            source_for_conversion = tmp_legacy if was_encrypted else input_path
+
+            # Step 2: convert to new format (OpenXML)
+            tmp_converted = output_path + ".tmp" + new_ext
+            _convert_with_libreoffice(source_for_conversion, tmp_converted)
+
+            # Step 3: strip XML protection from the converted file
+            strip_func(tmp_converted)
+            _remove_extra_protections_office(tmp_converted, log_label)
+
+            # Step 4: move to final output
+            shutil.move(tmp_converted, output_path)
+            log.info("  Converted %s → %s", ext, new_ext)
+
+            # Cleanup
+            if was_encrypted:
+                _cleanup(tmp_legacy)
+            return FileResult(path=output_path, status="unlocked", message=f"{log_label} unprotected & converted → {output_path}")
+
+        else:
+            # --- Legacy without conversion, or OpenXML ---
+            # Decrypt if needed
+            tmp_decrypted = output_path + ".tmp" + (new_ext if not is_legacy else ext)
+            was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_decrypted)
+            work_path = tmp_decrypted if was_encrypted else input_path
+
+            # Copy to output (avoid self-copy when in-place)
+            if os.path.realpath(work_path) != os.path.realpath(output_path):
+                shutil.copy2(work_path, output_path)
+
+            # Strip XML protection only for OpenXML files (not legacy binaries)
+            if not is_legacy:
+                strip_func(output_path)
+                _remove_extra_protections_office(output_path, log_label)
+
+            return FileResult(path=output_path, status="unlocked", message=f"{log_label} unprotected → {output_path}")
+
+    finally:
+        _cleanup(tmp_decrypted)
+        _cleanup(tmp_converted)
+
+
 def unprotect_excel(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    tmp_path = output_path + ".tmp.xlsx"
-    try:
-        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
-        work_path = tmp_path if was_encrypted else input_path
-        if os.path.realpath(work_path) != os.path.realpath(output_path):
-            shutil.copy2(work_path, output_path)
-        if ext in (".xlsx", ".xlsm") or (convert and ext == ".xls"):
-            _strip_excel_xml_protection(output_path)
-            _remove_extra_protections_office(output_path, "excel")
-        if convert and ext == ".xls":
-            converted_path = os.path.splitext(output_path)[0] + ".xlsx"
-            _convert_with_libreoffice(output_path, converted_path)
-            os.replace(converted_path, output_path)
-            log.info("  Converted .xls → .xlsx")
-    finally:
-        _cleanup(tmp_path)
-    return FileResult(path=output_path, status="unlocked", message=f"Excel unprotected → {output_path}")
+    return _handle_office_common(
+        input_path, password, output_path, convert,
+        is_legacy=(ext == ".xls"),
+        strip_func=_strip_excel_xml_protection,
+        new_ext=".xlsx",
+        log_label="Excel"
+    )
 
 
 def unprotect_word(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    tmp_path = output_path + ".tmp.docx"
-    try:
-        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
-        work_path = tmp_path if was_encrypted else input_path
-        if os.path.realpath(work_path) != os.path.realpath(output_path):
-            shutil.copy2(work_path, output_path)
-        if ext == ".docx" or (convert and ext == ".doc"):
-            _strip_word_xml_protection(output_path)
-            _remove_extra_protections_office(output_path, "word")
-        if convert and ext == ".doc":
-            converted_path = os.path.splitext(output_path)[0] + ".docx"
-            _convert_with_libreoffice(output_path, converted_path)
-            os.replace(converted_path, output_path)
-    finally:
-        _cleanup(tmp_path)
-    return FileResult(path=output_path, status="unlocked", message=f"Word unprotected → {output_path}")
+    return _handle_office_common(
+        input_path, password, output_path, convert,
+        is_legacy=(ext == ".doc"),
+        strip_func=_strip_word_xml_protection,
+        new_ext=".docx",
+        log_label="Word"
+    )
 
 
 def unprotect_powerpoint(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     ext = os.path.splitext(input_path)[1].lower()
-    tmp_path = output_path + ".tmp.pptx"
-    try:
-        was_encrypted = _msoffcrypto_decrypt(input_path, password or "", tmp_path)
-        work_path = tmp_path if was_encrypted else input_path
-        if os.path.realpath(work_path) != os.path.realpath(output_path):
-            shutil.copy2(work_path, output_path)
-        if ext == ".pptx" or (convert and ext == ".ppt"):
-            _strip_pptx_protections(output_path)
-            _remove_extra_protections_office(output_path, "powerpoint")
-        if convert and ext == ".ppt":
-            converted_path = os.path.splitext(output_path)[0] + ".pptx"
-            _convert_with_libreoffice(output_path, converted_path)
-            os.replace(converted_path, output_path)
-    finally:
-        _cleanup(tmp_path)
-    return FileResult(path=output_path, status="unlocked", message=f"PowerPoint unprotected → {output_path}")
+    return _handle_office_common(
+        input_path, password, output_path, convert,
+        is_legacy=(ext == ".ppt"),
+        strip_func=_strip_pptx_protections,
+        new_ext=".pptx",
+        log_label="PowerPoint"
+    )
 
 
+# Aliases for legacy formats (they just reuse the above logic with convert flag)
 def unprotect_doc(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
     return unprotect_word(input_path, password, output_path, convert)
 
