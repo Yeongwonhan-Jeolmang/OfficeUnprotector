@@ -396,37 +396,81 @@ def _print_check_result(result: FileResult, use_json: bool, json_accumulator: li
 def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwargs) -> FileResult:
     try:
         from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import ArrayObject
     except ImportError:
         raise UnprotectError("Missing dependency: pip install pypdf")
 
     reader = PdfReader(input_path)
+
+    # Handle encrypted PDFs
     if reader.is_encrypted:
         success = reader.decrypt(password or "")
+
+        # Retry empty password for owner-only encryption
         if success == 0 and password:
             success = reader.decrypt("")
+
         if success == 0:
-            raise UnprotectError("Wrong password (or file uses unsupported encryption)", code=2)
+            raise UnprotectError(
+                "Wrong password (or file uses unsupported encryption)",
+                code=2,
+            )
 
     writer = PdfWriter()
     writer.clone_reader_document_root(reader)
-    # Remove JavaScript
-    if "/Names" in reader.trailer.get("/Root", {}):
-        root = reader.trailer["/Root"]
-        if "/Names" in root and "/JavaScript" in root["/Names"]:
-            del root["/Names"]["/JavaScript"]
-    # Remove form restrictions
-    if "/AcroForm" in reader.trailer.get("/Root", {}):
-        del reader.trailer["/Root"]["/AcroForm"]
 
+    # ------------------------------------------------------------------
+    # Remove JavaScript and form restrictions from WRITER root
+    # ------------------------------------------------------------------
+    root = writer._root_object
+
+    # Remove JavaScript
+    if "/Names" in root:
+        names = root["/Names"]
+
+        if "/JavaScript" in names:
+            del names["/JavaScript"]
+            log.debug("  Removed embedded JavaScript")
+
+        # Remove empty Names dictionary
+        if len(names) == 0:
+            del root["/Names"]
+
+    # Remove AcroForm restrictions/forms
+    if "/AcroForm" in root:
+        del root["/AcroForm"]
+        log.debug("  Removed AcroForm")
+
+    # ------------------------------------------------------------------
+    # Remove redaction annotations
+    # ------------------------------------------------------------------
     for page in reader.pages:
         if "/Annots" in page:
-            page["/Annots"] = [a for a in page["/Annots"] if a.get("/Subtype") != "/Redact"]
+            filtered_annots = ArrayObject(
+                [
+                    annot
+                    for annot in page["/Annots"]
+                    if annot.get("/Subtype") != "/Redact"
+                ]
+            )
+
+            page["/Annots"] = filtered_annots
+
+            log.debug("  Removed redaction annotations")
+
         writer.add_page(page)
 
+    # ------------------------------------------------------------------
+    # Write cleaned PDF
+    # ------------------------------------------------------------------
     with open(output_path, "wb") as f:
         writer.write(f)
 
-    return FileResult(path=output_path, status="unlocked", message=f"PDF cleaned → {output_path}")
+    return FileResult(
+        path=output_path,
+        status="unlocked",
+        message=f"PDF cleaned → {output_path}",
+    )
 
 
 def unprotect_excel(input_path: str, password: str | None, output_path: str, convert: bool = False, **kwargs) -> FileResult:
@@ -807,7 +851,7 @@ Examples:
     if args.json_output:
         print(json.dumps(json_results, indent=2))
 
-    if len(input_paths) > 1 and not args.quiet:
+    if len(input_paths) > 1 and not args.quiet and not args.json_output:
         parts = [f"{counts[k]} {k}" for k in ("unlocked", "open", "skipped", "failed") if counts[k]]
         log.info("\nDone: %s", ", ".join(parts) if parts else "nothing processed")
 
