@@ -529,6 +529,7 @@ jobs:
             cp dummy.$ext test.$ext
             python unprotect.py test.$ext --check || true
           done
+        shell: bash   # <-- FIX: added bash shell for Windows compatibility
 
       - name: "[error] --output and --in-place are mutually exclusive (argparse exit 2)"
         run: |
@@ -591,8 +592,6 @@ jobs:
           EOF
         shell: bash
 
-  # ========== NEW TESTS (excluding --convert) ==========
-
   test-jobs:
     name: Test --jobs (Python 3.12)
     runs-on: ubuntu-latest
@@ -607,6 +606,7 @@ jobs:
           for i in 1 2 3; do
             python -c "from openpyxl import Workbook; Workbook().save('file$i.xlsx')"
           done
+        shell: bash
       - name: Run with --jobs 2 and verify no errors
         run: python unprotect.py file*.xlsx --output-dir out --jobs 2
       - name: Run with --jobs 4 on protected file (fixed command)
