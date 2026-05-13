@@ -3,9 +3,9 @@
 unprotect_gui.py — Full-featured GUI for unprotect.py
 All CLI features exposed: password/password-file/password-list, output/output-dir/in-place,
 backup, no-overwrite, fail-fast, check/dry-run, JSON export, glob/recursive input,
-verbose/quiet log, per-file status.
+verbose/quiet log, per-file status, plus new: parallel jobs (--jobs) and conversion (--convert).
 
-Requires:  pip install customtkinter pypdf msoffcrypto-tool lxml
+Requires:  pip install customtkinter pypdf msoffcrypto-tool lxml CTkSpinbox
 Place in the same directory as unprotect.py and run:  python unprotect_gui.py
 """
 
@@ -19,7 +19,8 @@ import sys
 import threading
 import time
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, filedialog, messagebox
+from tkinter import BooleanVar, IntVar, StringVar, filedialog, messagebox
+from CTkSpinbox import CTkSpinbox
 import tkinter as tk
 
 try:
@@ -579,7 +580,7 @@ class OutputTab(ctk.CTkFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab: Advanced
+# Tab: Advanced (updated with --jobs and --convert)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdvancedTab(ctk.CTkFrame):
@@ -623,9 +624,41 @@ class AdvancedTab(ctk.CTkFrame):
                                text_color=TEXT, fg_color=ACCENT,
                                ).pack(side="left", padx=(0, 20))
 
+        # ── NEW: Parallel jobs ────────────────────────────────────────────
+        jobs_card = _card()
+        jobs_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        SectionLabel(jobs_card, text="PARALLEL PROCESSING").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(8, 4))
+        frame_jobs = ctk.CTkFrame(jobs_card, fg_color="transparent")
+        frame_jobs.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        ctk.CTkLabel(frame_jobs, text="Workers:",
+                     font=ctk.CTkFont("Courier New", 11), text_color=TEXT).pack(side="left")
+        self._jobs_var = IntVar(value=1)
+        self._jobs_spin = CTkSpinbox(frame_jobs, start_value=1, min_value=1, max_value=16, step_value=1, variable=self._jobs_var, width=60, button_color=ACCENT, font=ctk.CTkFont("Courier New", 11), fg_color=CARD2, border_color=BORDER)
+        self._jobs_spin.pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(frame_jobs, text="(1-16 workers – parallel processing not yet implemented in the GUI)", font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
+
+        # ── NEW: Convert legacy formats (--convert) ────────────────────────
+        convert_card = _card()
+        convert_card.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        SectionLabel(convert_card, text="AUTOMATIC CONVERSION").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(8, 4))
+        self._convert_var = BooleanVar()
+        ck = ctk.CTkCheckBox(convert_card,
+                             text="Convert legacy binary formats to OpenXML (--convert)",
+                             variable=self._convert_var,
+                             font=ctk.CTkFont("Courier New", 11),
+                             text_color=TEXT, fg_color=ACCENT)
+        ck.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
+        ctk.CTkLabel(convert_card,
+                     text="Requires LibreOffice installed and in PATH. Converts .doc→.docx, .xls→.xlsx, .ppt→.pptx.\n"
+                          "Warning: macros may be lost during conversion.",
+                     font=ctk.CTkFont("Courier New", 9), text_color=WARN,
+                     wraplength=700, justify="left").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+
         # JSON export
         json_card = _card()
-        json_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        json_card.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         SectionLabel(json_card,
                      text="JSON EXPORT  (Inspect/Check mode only -- mirrors --check --json)").grid(
             row=0, column=0, sticky="w", padx=12, pady=(8, 6))
@@ -649,17 +682,25 @@ class AdvancedTab(ctk.CTkFrame):
     def json_export(self) -> bool:
         return self._json_var.get()
 
+    @property
+    def jobs(self) -> int:
+        return self._jobs_var.get()
+
+    @property
+    def convert(self) -> bool:
+        return self._convert_var.get()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Application
+# Main Application (with scrollable area)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class UnprotectApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Unprotect")
-        self.geometry("860x820")
-        self.minsize(720, 640)
+        self.geometry("860x880")
+        self.minsize(720, 680)
         self.configure(fg_color=BG)
 
         self._q: queue.Queue = queue.Queue()
@@ -672,7 +713,7 @@ class UnprotectApp(ctk.CTk):
             self.log("unprotect.py not found in the same directory.", "warn")
             self.log("Place unprotect.py alongside this file and restart.", "warn")
 
-    # ── Layout ────────────────────────────────────────────────────────────
+    # ── Layout with scrollable area ───────────────────────────────────────
 
     def _build(self):
         # Header
@@ -686,10 +727,16 @@ class UnprotectApp(ctk.CTk):
                      font=ctk.CTkFont("Courier New", 9),
                      text_color=TEXT_DIM).pack(side="left", padx=4)
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=14, pady=10)
+        # Main scrollable area
+        main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent",
+                                             scrollbar_button_color=BORDER,
+                                             scrollbar_button_hover_color=ACCENT)
+        main_scroll.pack(fill="both", expand=True, padx=14, pady=10)
+
+        # Place everything inside the scrollable frame
+        body = ctk.CTkFrame(main_scroll, fg_color="transparent")
+        body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
 
         # Tabview
         self._tabs = ctk.CTkTabview(
@@ -704,7 +751,7 @@ class UnprotectApp(ctk.CTk):
             border_width=1, border_color=BORDER,
             corner_radius=10,
         )
-        self._tabs.grid(row=0, column=0, sticky="nsew")
+        self._tabs.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         for name in ("Files", "Password", "Output", "Advanced"):
             self._tabs.add(name)
@@ -830,6 +877,20 @@ class UnprotectApp(ctk.CTk):
                 "not with Unprotect.")
             return False
 
+        # Warn about conversion without LibreOffice (but don't block)
+        if not check_only and adv.convert:
+            import shutil
+            if not shutil.which("libreoffice"):
+                response = messagebox.askyesno(
+                    "LibreOffice missing",
+                    "Conversion requires LibreOffice to be installed and in PATH.\n"
+                    "Without it, conversion will fail.\n\n"
+                    "Do you want to continue anyway?",
+                    icon="warning"
+                )
+                if not response:
+                    return False
+
         return True
 
     # ── Run Check ─────────────────────────────────────────────────────────
@@ -893,6 +954,9 @@ class UnprotectApp(ctk.CTk):
         pw        = self._password_tab
         adv       = self._advanced_tab
         fail_fast = adv.fail_fast
+        convert_flag = adv.convert
+        # jobs value is read but not used for parallel processing in GUI
+        # (would require a redesign of the worker loop)
 
         # Resolve password once (unless wordlist mode, resolved per-file)
         password: str | None = None
@@ -919,6 +983,7 @@ class UnprotectApp(ctk.CTk):
                         output_dir=out.output_dir if out.mode == "dir" else None,
                         backup=out.backup,
                         no_overwrite=out.no_overwrite,
+                        convert=convert_flag,
                     )
                 else:
                     result = unprotect_file(
@@ -929,6 +994,7 @@ class UnprotectApp(ctk.CTk):
                         output_dir=out.output_dir if out.mode == "dir" else None,
                         backup=out.backup,
                         no_overwrite=out.no_overwrite,
+                        convert=convert_flag,
                     )
 
                 self._q.put(("row", row, result.status, result.message))
@@ -953,7 +1019,7 @@ class UnprotectApp(ctk.CTk):
                     self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
                     break
 
-        # Batch summary (mirrors CLI)
+        # Batch summary
         if total > 1:
             parts = []
             if counts["unlocked"]: parts.append(f"{counts['unlocked']} unlocked")
