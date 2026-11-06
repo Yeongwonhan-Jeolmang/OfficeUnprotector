@@ -44,7 +44,8 @@ jobs:
           from docx import Document
           from pptx import Presentation
           from pypdf import PdfWriter, PdfReader
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject, ArrayObject
+          from pypdf.generic import (RectangleObject, DictionaryObject, NameObject,
+                                     ArrayObject, TextStringObject)
 
           NS_XLSX = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           NS_DOCX = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -122,10 +123,20 @@ jobs:
           with open("test_plain.pdf", "wb") as f:
               w_plain.write(f)
 
-          # PDF with JavaScript
+          # PDF with document-level JavaScript.
+          # pypdf 7 removed PdfWriter.add_js, so build the /Names/JavaScript
+          # name tree directly (works across pypdf 4-7).
           w_js = PdfWriter()
           w_js.add_blank_page(200, 200)
-          w_js.add_js("app.alert('test');")
+          js_action = DictionaryObject()
+          js_action[NameObject("/S")] = NameObject("/JavaScript")
+          js_action[NameObject("/JS")] = TextStringObject("app.alert('test');")
+          js_ref = w_js._add_object(js_action)
+          js_tree = DictionaryObject()
+          js_tree[NameObject("/Names")] = ArrayObject([TextStringObject("JS1"), js_ref])
+          names_dict = DictionaryObject()
+          names_dict[NameObject("/JavaScript")] = js_tree
+          w_js._root_object[NameObject("/Names")] = names_dict
           with open("test_with_js.pdf", "wb") as f:
               w_js.write(f)
 
@@ -711,7 +722,7 @@ jobs:
         run: |
           python -c "
           from pypdf import PdfWriter
-          from pypdf.generic import RectangleObject, DictionaryObject, NameObject, ArrayObject
+          from pypdf.generic import RectangleObject, DictionaryObject, NameObject, ArrayObject, TextStringObject
 
           # owner‑only
           w = PdfWriter()
@@ -720,10 +731,18 @@ jobs:
           with open('owner.pdf','wb') as f:
               w.write(f)
 
-          # with JS
+          # with JS (pypdf 7 removed add_js; build the /Names/JavaScript tree directly)
           w2 = PdfWriter()
           w2.add_blank_page(200,200)
-          w2.add_js('app.alert(1);')
+          jsa = DictionaryObject()
+          jsa[NameObject('/S')] = NameObject('/JavaScript')
+          jsa[NameObject('/JS')] = TextStringObject('app.alert(1);')
+          jsref = w2._add_object(jsa)
+          jst = DictionaryObject()
+          jst[NameObject('/Names')] = ArrayObject([TextStringObject('JS1'), jsref])
+          nd = DictionaryObject()
+          nd[NameObject('/JavaScript')] = jst
+          w2._root_object[NameObject('/Names')] = nd
           with open('js.pdf','wb') as f:
               w2.write(f)
 
