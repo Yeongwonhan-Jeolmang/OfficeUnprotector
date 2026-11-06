@@ -213,6 +213,33 @@ jobs:
           python unprotect.py test_protected.xlsx -o out_protected.xlsx
           python unprotect.py --check out_protected.xlsx
 
+      - name: "[xlsx] Unlocks workbook with many protected sheets (single-pass rewrite)"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, zipfile
+          import lxml.etree as etree
+          from openpyxl import Workbook
+          NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          wb = Workbook()
+          wb.remove(wb.active)
+          for i in range(8):
+              ws = wb.create_sheet(f"s{i}")
+              ws["A1"] = i
+              ws.protection.sheet = True
+          wb.save("multi.xlsx")
+          r = subprocess.run([sys.executable, "unprotect.py", "multi.xlsx", "-o", "multi_out.xlsx"],
+                             capture_output=True, text=True)
+          assert r.returncode == 0, r.stdout + r.stderr
+          # Every sheet must be free of sheetProtection after a single repack.
+          with zipfile.ZipFile("multi_out.xlsx") as z:
+              for n in z.namelist():
+                  if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"):
+                      root = etree.fromstring(z.read(n))
+                      assert root.find(f"{{{NS}}}sheetProtection") is None, f"{n} still protected"
+          print("OK — all sheets unlocked")
+          EOF
+        shell: bash
+
       - name: "[docx] Removes document protection"
         run: |
           python unprotect.py test_protected.docx -o out_protected.docx
@@ -363,6 +390,19 @@ jobs:
           EOF
         shell: bash
 
+      # ── --version ────────────────────────────────────────────────────────
+      - name: "[version] Prints version and exits 0"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "unprotect.py", "--version"],
+                             capture_output=True, text=True)
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert r.stdout.strip(), f"Expected a version string, got nothing"
+          print("OK:", r.stdout.strip())
+          EOF
+        shell: bash
+
       # ── --password-file ──────────────────────────────────────────────────
       - name: "[password-file] Reads password from file"
         run: |
@@ -445,6 +485,23 @@ jobs:
           assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
           assert "Done:" in r.stdout, f"Expected 'Done:' summary line:\n{r.stdout}"
           assert "unlocked" in r.stdout
+          print("OK")
+          EOF
+        shell: bash
+
+      - name: "[check] Batch summary counts protected files (not failed)"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "--check",
+               "test_protected.xlsx", "test_protected.docx"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert "Done:" in r.stdout, f"Expected summary line:\n{r.stdout}"
+          assert "protected" in r.stdout, f"Expected 'protected' in summary:\n{r.stdout}"
+          assert "failed" not in r.stdout, f"Did not expect 'failed' in summary:\n{r.stdout}"
           print("OK")
           EOF
         shell: bash
@@ -609,6 +666,27 @@ jobs:
         shell: bash
       - name: Run with --jobs 2 and verify no errors
         run: python unprotect.py file*.xlsx --output-dir out --jobs 2
+      - name: "Parallel batch summary reports results (not 'nothing processed')"
+        run: |
+          python - << 'EOF'
+          import subprocess, sys
+          from openpyxl import Workbook
+          # Protected inputs so a correct run reports them as 'unlocked'.
+          for i in range(3):
+              wb = Workbook(); wb.active["A1"] = i; wb.active.protection.sheet = True
+              wb.save(f"pj{i}.xlsx")
+          r = subprocess.run(
+              [sys.executable, "unprotect.py", "pj0.xlsx", "pj1.xlsx", "pj2.xlsx",
+               "--output-dir", "pjout", "--jobs", "3"],
+              capture_output=True, text=True
+          )
+          assert r.returncode == 0, f"Exit {r.returncode}: {r.stdout}{r.stderr}"
+          assert "nothing processed" not in r.stdout, \
+              f"Parallel summary dropped results (regression):\n{r.stdout}"
+          assert "unlocked" in r.stdout, f"Expected 'unlocked' in summary:\n{r.stdout}"
+          print("OK")
+          EOF
+        shell: bash
       - name: Run with --jobs 4 on protected file (fixed command)
         run: |
           python -c "
@@ -697,3 +775,61 @@ jobs:
           assert len(redacts) == 0, f'Found {len(redacts)} redaction annotations'
           print('Redactions removed')
           "
+      - name: Create owner-locked PDF carrying document metadata
+        run: |
+          python -c "
+          from pypdf import PdfWriter
+          w = PdfWriter()
+          w.add_blank_page(200, 200)
+          w.add_metadata({'/Title': 'Keep Me', '/Author': 'Owner'})
+          w.encrypt(user_password='', owner_password='owner')
+          with open('meta.pdf', 'wb') as f:
+              w.write(f)
+          "
+      - name: Run unprotect and verify metadata is preserved
+        run: |
+          python unprotect.py meta.pdf --output cleaned_meta.pdf
+          python -c "
+          from pypdf import PdfReader
+          r = PdfReader('cleaned_meta.pdf')
+          assert not r.is_encrypted, 'Owner password not removed'
+          md = r.metadata or {}
+          assert md.get('/Title') == 'Keep Me', f'Title lost: {dict(md)}'
+          assert md.get('/Author') == 'Owner', f'Author lost: {dict(md)}'
+          print('Metadata preserved')
+          "
+
+  test-gui:
+    name: Test GUI (headless smoke, Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies (core + GUI + xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          python -m pip install --upgrade pip
+          pip install msoffcrypto-tool pypdf lxml customtkinter CTkSpinbox
+      - name: Byte-compile both modules
+        run: python -m py_compile unprotect.py unprotect_gui.py
+      - name: Headless construct + live-stats smoke test
+        run: |
+          xvfb-run -a python - << 'EOF'
+          import unprotect_gui as g
+          app = g.UnprotectApp()
+          app.update()
+          # Exercise the file-count chip and summary-stats wiring (files need not
+          # exist on disk: FileRow renders from the path, add_file -> _refresh_stats).
+          app._input_tab.add_file("demo.pdf")
+          app._input_tab.add_file("sheet.xlsx")
+          app.update()
+          assert app._count_var.get() == "2 files", app._count_var.get()
+          app._refresh_stats()
+          app.update()
+          app.destroy()
+          print("GUI smoke OK")
+          EOF
+        shell: bash
