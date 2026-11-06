@@ -22,13 +22,18 @@ from dataclasses import dataclass, field
 from typing import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+__version__ = "1.1.0"
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 log = logging.getLogger("unprotect")
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(message)s"))
-log.addHandler(_handler)
+# Guard against duplicate handlers when the module is imported more than once
+# (e.g. by the GUI and again by a worker process).
+if not log.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(_handler)
 log.setLevel(logging.INFO)
 
 
@@ -81,21 +86,46 @@ def _cleanup(path: str):
         os.remove(path)
 
 
-def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
+def _rewrite_zip_entries(
+    zip_path: str,
+    replacements: dict[str, bytes] | None = None,
+    deletions: set[str] | None = None,
+):
+    """Rewrite a zip archive exactly once, replacing and/or dropping entries.
+
+    ``replacements`` maps archive names to their new bytes; ``deletions`` is a
+    set of archive names to omit entirely. Doing every change in a single pass
+    avoids re-reading and re-compressing the whole archive once per entry, which
+    is a large win for files with many protected parts (e.g. a workbook with
+    many sheets). Unchanged entries are copied with their original compression.
+    """
+    replacements = replacements or {}
+    deletions = deletions or set()
+    if not replacements and not deletions:
+        return
     tmp_zip = zip_path + ".zip.tmp"
     try:
         with zipfile.ZipFile(zip_path, "r") as zin, \
                 zipfile.ZipFile(tmp_zip, "w") as zout:
             for item in zin.infolist():
-                data = zin.read(item.filename)
-                if item.filename == filename_in_zip:
-                    data = new_content
+                if item.filename in deletions:
+                    log.debug("  Dropped %s from zip", item.filename)
+                    continue
+                if item.filename in replacements:
+                    data = replacements[item.filename]
+                    log.debug("  Rewrote %s inside zip", item.filename)
+                else:
+                    data = zin.read(item.filename)
                 zout.writestr(item, data, compress_type=item.compress_type)
         os.replace(tmp_zip, zip_path)
-        log.debug("  Rewrote %s inside zip", filename_in_zip)
     except Exception:
         _cleanup(tmp_zip)
         raise
+
+
+def _rewrite_zip(zip_path: str, filename_in_zip: str, new_content: bytes):
+    """Backwards-compatible single-entry wrapper around _rewrite_zip_entries."""
+    _rewrite_zip_entries(zip_path, {filename_in_zip: new_content})
 
 
 def _resolve_output(
@@ -168,36 +198,39 @@ def _strip_excel_xml_protection(xlsx_path: str):
     except ImportError:
         log.warning("lxml not installed, cannot strip Excel XML protections")
         return
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    # Read every part we may touch in a single pass over the archive.
     with zipfile.ZipFile(xlsx_path, "r") as z:
         names = z.namelist()
         wb_name = next((n for n in names if n.endswith("workbook.xml")), None)
-        wb_xml = z.read(wb_name) if wb_name else None
         sheet_names = [n for n in names
                        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+        contents = {n: z.read(n) for n in ([wb_name] if wb_name else []) + sheet_names}
 
-    if wb_name and wb_xml is not None:
-        wb_root = etree.fromstring(wb_xml)
-        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-        removed = [el for el in wb_root.findall(f"{{{ns}}}workbookProtection")]
+    replacements: dict[str, bytes] = {}
+
+    if wb_name:
+        wb_root = etree.fromstring(contents[wb_name])
+        removed = wb_root.findall(f"{{{ns}}}workbookProtection")
         for el in removed:
             wb_root.remove(el)
             log.debug("  Removed workbookProtection from %s", wb_name)
         if removed:
-            new_xml = etree.tostring(wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
-            _rewrite_zip(xlsx_path, wb_name, new_xml)
+            replacements[wb_name] = etree.tostring(
+                wb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
     for sheet_name in sheet_names:
-        with zipfile.ZipFile(xlsx_path, "r") as z:
-            sheet_xml = z.read(sheet_name)
-        root = etree.fromstring(sheet_xml)
-        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-        removed = [el for el in root.findall(f"{{{ns}}}sheetProtection")]
+        root = etree.fromstring(contents[sheet_name])
+        removed = root.findall(f"{{{ns}}}sheetProtection")
         for el in removed:
             root.remove(el)
             log.debug("  Removed sheetProtection from %s", sheet_name)
         if removed:
-            new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-            _rewrite_zip(xlsx_path, sheet_name, new_xml)
+            replacements[sheet_name] = etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # One rewrite for the whole workbook instead of one per protected part.
+    _rewrite_zip_entries(xlsx_path, replacements)
 
 
 def _strip_word_xml_protection(docx_path: str):
@@ -230,14 +263,21 @@ def _strip_pptx_protections(pptx_path: str):
     except ImportError:
         log.warning("lxml not installed, cannot strip PowerPoint XML protections")
         return
+    ns_pml = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    # Read the presentation part and every slide in a single pass.
     with zipfile.ZipFile(pptx_path, "r") as z:
         names = z.namelist()
         prs_name = next((n for n in names if n.endswith("presentation.xml")), None)
         if prs_name is None:
             return
-        prs_xml = z.read(prs_name)
-    root = etree.fromstring(prs_xml)
-    ns_pml = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        slide_names = [n for n in names
+                       if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
+        contents = {n: z.read(n) for n in [prs_name] + slide_names}
+
+    replacements: dict[str, bytes] = {}
+
+    root = etree.fromstring(contents[prs_name])
     changed = False
     for tag in ("modifyVerifier", "writeProtection"):
         for el in root.findall(f"{{{ns_pml}}}{tag}"):
@@ -245,18 +285,12 @@ def _strip_pptx_protections(pptx_path: str):
             log.debug("  Removed %s from %s", tag, prs_name)
             changed = True
     if changed:
-        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-        _rewrite_zip(pptx_path, prs_name, new_xml)
+        replacements[prs_name] = etree.tostring(
+            root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
-    # Remove locked OLE objects
-    with zipfile.ZipFile(pptx_path, "r") as z:
-        slide_names = [n for n in z.namelist()
-                       if n.startswith("ppt/slides/slide") and n.endswith(".xml")]
+    # Remove locked OLE objects, slide by slide
     for slide_name in slide_names:
-        with zipfile.ZipFile(pptx_path, "r") as z:
-            slide_xml = z.read(slide_name)
-        slide_root = etree.fromstring(slide_xml)
-        mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+        slide_root = etree.fromstring(contents[slide_name])
         slide_changed = False
         for ac in slide_root.findall(f".//{{{mc_ns}}}AlternateContent"):
             parent = ac.getparent()
@@ -267,19 +301,28 @@ def _strip_pptx_protections(pptx_path: str):
                     log.debug("  Removed locked AlternateContent from %s", slide_name)
                     slide_changed = True
         if slide_changed:
-            new_slide_xml = etree.tostring(slide_root, xml_declaration=True,
-                                          encoding="UTF-8", standalone=True)
-            _rewrite_zip(pptx_path, slide_name, new_slide_xml)
+            replacements[slide_name] = etree.tostring(
+                slide_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # One rewrite for the whole presentation instead of one per modified part.
+    _rewrite_zip_entries(pptx_path, replacements)
 
 
 def _remove_extra_protections_office(zip_path: str, file_type: str):
-    """Remove digital signatures, etc."""
+    """Remove digital signatures, etc.
+
+    Signature parts are dropped from the archive outright rather than blanked
+    out: an empty ``signatures.xml`` is malformed and some Office versions warn
+    about it, whereas a missing optional part is simply treated as unsigned. All
+    signature parts are removed in a single rewrite.
+    """
     with zipfile.ZipFile(zip_path, "r") as z:
         names = z.namelist()
-        sig_entries = [n for n in names if "_xmlsignatures" in n or n.endswith("signatures.xml")]
-    for entry in sig_entries:
-        _rewrite_zip(zip_path, entry, b"")
-        log.debug("  Removed signature entry: %s", entry)
+        sig_entries = {n for n in names if "_xmlsignatures" in n or n.endswith("signatures.xml")}
+    if sig_entries:
+        _rewrite_zip_entries(zip_path, deletions=sig_entries)
+        for entry in sig_entries:
+            log.debug("  Removed signature entry: %s", entry)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +504,15 @@ def unprotect_pdf(input_path: str, password: str | None, output_path: str, **kwa
     if "/AcroForm" in root:
         del root["/AcroForm"]
         log.debug("  Removed AcroForm")
+
+    # Preserve document metadata (Title/Author/etc.); a fresh PdfWriter would
+    # otherwise drop the original /Info dictionary.
+    if reader.metadata:
+        try:
+            writer.add_metadata(reader.metadata)
+            log.debug("  Preserved document metadata")
+        except Exception:
+            pass
 
     # Write cleaned PDF
     with open(output_path, "wb") as f:
@@ -756,6 +808,8 @@ Examples:
   unprotect.py *.pdf --check --json
 """,
     )
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
     parser.add_argument("files", nargs="+", help="Path(s) or glob pattern(s)")
     pw_group = parser.add_mutually_exclusive_group()
     pw_group.add_argument("--password", "-p", default=None)
@@ -818,24 +872,27 @@ Examples:
     # Parallel processing
     if args.jobs > 1:
         log.debug("Using %d parallel workers", args.jobs)
-        results = []
+        results_by_input: dict[str, FileResult] = {}
         with ProcessPoolExecutor(max_workers=args.jobs) as executor:
             futures = {
                 executor.submit(_process_one, (path, args, password, args.convert)): path
                 for path in input_paths
             }
             for future in as_completed(futures):
+                in_path = futures[future]
                 try:
-                    res = future.result()
-                    results.append(res)
+                    results_by_input[in_path] = future.result()
                 except Exception as e:
-                    results.append(FileResult(path=futures[future], status="failed", message=f"Error: {e}", error_code=1))
+                    results_by_input[in_path] = FileResult(
+                        path=in_path, status="failed", message=f"Error: {e}", error_code=1)
                     if args.fail_fast:
                         for f in futures:
                             f.cancel()
                         break
-        ordered = {res.path: res for res in results}
-        results = [ordered[p] for p in input_paths if p in ordered]
+        # Key results by their input path (a successful FileResult.path is the
+        # *output* path, so keying by that would lose the input association and
+        # drop every unlocked file from the summary) and restore input order.
+        results = [results_by_input[p] for p in input_paths if p in results_by_input]
     else:
         results = []
         for path in input_paths:
@@ -880,7 +937,7 @@ Examples:
                     break
 
     json_results = []
-    counts = {"unlocked": 0, "open": 0, "skipped": 0, "failed": 0}
+    counts = {"unlocked": 0, "open": 0, "protected": 0, "skipped": 0, "failed": 0}
     exit_code = 0
     for res in results:
         if args.check:
@@ -899,7 +956,8 @@ Examples:
         print(json.dumps(json_results, indent=2))
 
     if len(input_paths) > 1 and not args.quiet and not args.json_output:
-        parts = [f"{counts[k]} {k}" for k in ("unlocked", "open", "skipped", "failed") if counts[k]]
+        order = ("unlocked", "open", "protected", "skipped", "failed")
+        parts = [f"{counts[k]} {k}" for k in order if counts[k]]
         log.info("\nDone: %s", ", ".join(parts) if parts else "nothing processed")
 
     sys.exit(exit_code)

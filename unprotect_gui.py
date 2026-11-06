@@ -18,6 +18,7 @@ import queue
 import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import BooleanVar, IntVar, StringVar, filedialog, messagebox
 from CTkSpinbox import CTkSpinbox
@@ -137,6 +138,10 @@ class FileRow(ctk.CTkFrame):
         self._pill.configure(text_color=c)
         self._msg_lbl.configure(text_color=c if status != "pending" else TEXT_DIM)
 
+    @property
+    def status(self) -> str:
+        return self._status
+
 
 class LogPanel(ctk.CTkFrame):
     LEVELS = {"debug": TEXT_DIM, "info": TEXT, "ok": SUCCESS,
@@ -185,6 +190,39 @@ class LogPanel(ctk.CTkFrame):
         self.clipboard_append(content)
 
 
+class StatsBar(ctk.CTkFrame):
+    """A compact row of coloured count chips summarising file statuses."""
+
+    ORDER = [("unlocked", "unlocked"), ("open", "open"), ("protected", "protected"),
+             ("skipped", "skipped"), ("failed", "failed"), ("pending", "queued")]
+
+    def __init__(self, master, **kw):
+        super().__init__(master, fg_color=SURFACE, corner_radius=8,
+                         border_width=1, border_color=BORDER, **kw)
+        self._chips: dict[str, ctk.CTkLabel] = {}
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.pack(fill="x", padx=10, pady=7)
+        SectionLabel(inner, text="SUMMARY").pack(side="left", padx=(0, 10))
+        for key, label in self.ORDER:
+            chip = ctk.CTkLabel(
+                inner, text=f"0 {label}", height=22,
+                font=ctk.CTkFont("Courier New", 9, "bold"),
+                fg_color=CARD, corner_radius=11, text_color=TEXT_DIM,
+                padx=10)
+            chip.pack(side="left", padx=3)
+            self._chips[key] = chip
+
+    def update_counts(self, counts: dict[str, int]):
+        for key, label in self.ORDER:
+            n = counts.get(key, 0)
+            chip = self._chips[key]
+            color = STATUS_COLOR.get(key, TEXT_DIM)
+            # Light up a chip only when it has a non-zero count.
+            chip.configure(text=f"{n} {label}",
+                           text_color=color if n else TEXT_DIM,
+                           fg_color=CARD2 if n else CARD)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab: Files
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,12 +246,13 @@ class InputTab(ctk.CTkFrame):
             row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
 
         self._glob_var = StringVar()
-        ctk.CTkEntry(glob_frame, textvariable=self._glob_var,
-                     placeholder_text="e.g.  *.xlsx  or  /docs/**/*.pdf",
+        glob_entry = ctk.CTkEntry(glob_frame, textvariable=self._glob_var,
+                     placeholder_text="e.g.  *.xlsx  or  /docs/**/*.pdf   (press Enter to add)",
                      font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER, text_color=TEXT,
-                     ).grid(row=1, column=0, columnspan=2, sticky="ew",
-                            padx=(12, 6), pady=(0, 8))
+                     fg_color=CARD2, border_color=BORDER, text_color=TEXT)
+        glob_entry.grid(row=1, column=0, columnspan=2, sticky="ew",
+                        padx=(12, 6), pady=(0, 8))
+        glob_entry.bind("<Return>", lambda _e: self._expand_glob())
 
         self._recursive_var = BooleanVar()
         ctk.CTkCheckBox(glob_frame, text="Recursive (**)",
@@ -291,6 +330,7 @@ class InputTab(ctk.CTkFrame):
         row = FileRow(self._scroll, path, on_remove=self._remove)
         row.grid(row=len(self._rows), column=0, sticky="ew", pady=(0, 5))
         self._rows.append(row)
+        self.app._refresh_stats()
 
     def _remove(self, row: FileRow):
         row.destroy()
@@ -302,6 +342,7 @@ class InputTab(ctk.CTkFrame):
                 text="No files yet. Browse or enter a glob pattern above.",
                 font=ctk.CTkFont("Courier New", 10), text_color=TEXT_DIM)
             self._empty_lbl.grid(row=0, column=0, pady=30)
+        self.app._refresh_stats()
 
     def clear_all(self):
         for r in list(self._rows):
@@ -636,7 +677,7 @@ class AdvancedTab(ctk.CTkFrame):
         self._jobs_var = IntVar(value=1)
         self._jobs_spin = CTkSpinbox(frame_jobs, start_value=1, min_value=1, max_value=16, step_value=1, variable=self._jobs_var, width=60, button_color=ACCENT, font=ctk.CTkFont("Courier New", 11), fg_color=CARD2, border_color=BORDER)
         self._jobs_spin.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(frame_jobs, text="(1-16 workers – parallel processing not yet implemented in the GUI)", font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(frame_jobs, text="(1-16 worker processes – values >1 process files in parallel)", font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
 
         # ── NEW: Convert legacy formats (--convert) ────────────────────────
         convert_card = _card()
@@ -722,10 +763,16 @@ class UnprotectApp(ctk.CTk):
         hdr.pack_propagate(False)
         ctk.CTkLabel(hdr, text="UNPROTECT",
                      font=ctk.CTkFont("Courier New", 17, "bold"),
-                     text_color=TEXT).pack(side="left", padx=18)
+                     text_color=TEXT).pack(side="left", padx=(18, 6))
         ctk.CTkLabel(hdr, text="PDF  XLSX  DOCX  PPTX",
                      font=ctk.CTkFont("Courier New", 9),
                      text_color=TEXT_DIM).pack(side="left", padx=4)
+
+        self._count_var = StringVar(value="0 files")
+        ctk.CTkLabel(hdr, textvariable=self._count_var, height=24,
+                     font=ctk.CTkFont("Courier New", 9, "bold"),
+                     fg_color=CARD, corner_radius=12, text_color=INFO,
+                     padx=12).pack(side="right", padx=18)
 
         # Main scrollable area
         main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent",
@@ -805,9 +852,13 @@ class UnprotectApp(ctk.CTk):
                                       text_color=TEXT_DIM)
         self._prog_lbl.pack(side="left", padx=8)
 
+        # Live summary chips
+        self._stats_bar = StatsBar(body)
+        self._stats_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
         # Log
         self._log_panel = LogPanel(body)
-        self._log_panel.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self._log_panel.grid(row=3, column=0, sticky="ew", pady=(10, 0))
 
     # ── Logging ───────────────────────────────────────────────────────────
 
@@ -818,6 +869,17 @@ class UnprotectApp(ctk.CTk):
         if verbosity != "verbose" and level == "debug":
             return
         self._log_panel.append(text, level)
+
+    # ── Live stats ────────────────────────────────────────────────────────
+
+    def _refresh_stats(self):
+        """Recompute the header count and summary chips from current row states."""
+        rows = self._input_tab.file_rows
+        self._count_var.set(f"{len(rows)} file" + ("" if len(rows) == 1 else "s"))
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r.status] = counts.get(r.status, 0) + 1
+        self._stats_bar.update_counts(counts)
 
     # ── Busy state ────────────────────────────────────────────────────────
 
@@ -955,8 +1017,7 @@ class UnprotectApp(ctk.CTk):
         adv       = self._advanced_tab
         fail_fast = adv.fail_fast
         convert_flag = adv.convert
-        # jobs value is read but not used for parallel processing in GUI
-        # (would require a redesign of the worker loop)
+        jobs      = max(1, adv.jobs)
 
         # Resolve password once (unless wordlist mode, resolved per-file)
         password: str | None = None
@@ -970,54 +1031,85 @@ class UnprotectApp(ctk.CTk):
 
         counts = {"unlocked": 0, "open": 0, "skipped": 0, "failed": 0}
 
-        for i, row in enumerate(rows):
-            self._q.put(("progress", i / total, f"{i}/{total}"))
-            self._q.put(("row", row, "running", "processing..."))
-            try:
-                if pw.mode == "list":
-                    result = _try_password_list(
-                        input_path=row.path,
-                        wordlist_path=pw.wordlist_path,
-                        output_path=out.output_file if out.mode == "file" else None,
-                        in_place=out.in_place,
-                        output_dir=out.output_dir if out.mode == "dir" else None,
-                        backup=out.backup,
-                        no_overwrite=out.no_overwrite,
-                        convert=convert_flag,
-                    )
-                else:
-                    result = unprotect_file(
-                        input_path=row.path,
-                        password=password,
-                        output_path=out.output_file if out.mode == "file" else None,
-                        in_place=out.in_place,
-                        output_dir=out.output_dir if out.mode == "dir" else None,
-                        backup=out.backup,
-                        no_overwrite=out.no_overwrite,
-                        convert=convert_flag,
-                    )
+        # Shared per-file call: (callable, kwargs) usable both in-process and
+        # in a worker process. Both targets are module-level and all arguments
+        # are plain strings/bools, so they pickle cleanly for ProcessPoolExecutor.
+        def _call_for(path: str):
+            common = dict(
+                output_path=out.output_file if out.mode == "file" else None,
+                in_place=out.in_place,
+                output_dir=out.output_dir if out.mode == "dir" else None,
+                backup=out.backup,
+                no_overwrite=out.no_overwrite,
+                convert=convert_flag,
+            )
+            if pw.mode == "list":
+                return _try_password_list, dict(input_path=path,
+                                                wordlist_path=pw.wordlist_path, **common)
+            return unprotect_file, dict(input_path=path, password=password, **common)
 
-                self._q.put(("row", row, result.status, result.message))
-                level = {"unlocked": "ok", "skipped": "warn",
-                         "failed": "err", "open": "info"}.get(result.status, "info")
-                self._q.put(("log", f"{Path(row.path).name}: {result.message}", level))
-                key = result.status if result.status in counts else "failed"
-                counts[key] += 1
+        def _record(row, result):
+            self._q.put(("row", row, result.status, result.message))
+            level = {"unlocked": "ok", "skipped": "warn",
+                     "failed": "err", "open": "info"}.get(result.status, "info")
+            self._q.put(("log", f"{Path(row.path).name}: {result.message}", level))
+            key = result.status if result.status in counts else "failed"
+            counts[key] += 1
 
-            except UnprotectError as e:
-                self._q.put(("row", row, "failed", str(e)))
-                self._q.put(("log", f"{Path(row.path).name}: {e}", "err"))
-                counts["failed"] += 1
-                if fail_fast:
-                    self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
-                    break
-            except Exception as e:
-                self._q.put(("row", row, "failed", str(e)))
-                self._q.put(("log", f"{Path(row.path).name}: unexpected error -- {e}", "err"))
-                counts["failed"] += 1
-                if fail_fast:
-                    self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
-                    break
+        def _record_error(row, exc, unexpected=False):
+            self._q.put(("row", row, "failed", str(exc)))
+            prefix = "unexpected error -- " if unexpected else ""
+            self._q.put(("log", f"{Path(row.path).name}: {prefix}{exc}", "err"))
+            counts["failed"] += 1
+
+        if jobs > 1 and total > 1:
+            # ── Parallel path ──────────────────────────────────────────────
+            self._q.put(("log", f"Processing {total} files with {jobs} workers...", "info"))
+            path_to_row = {r.path: r for r in rows}
+            for r in rows:
+                self._q.put(("row", r, "running", "queued..."))
+            done = 0
+            stop = False
+            with ProcessPoolExecutor(max_workers=jobs) as executor:
+                fut_to_path = {}
+                for row in rows:
+                    fn, kwargs = _call_for(row.path)
+                    fut_to_path[executor.submit(fn, **kwargs)] = row.path
+                for future in as_completed(fut_to_path):
+                    row = path_to_row[fut_to_path[future]]
+                    try:
+                        _record(row, future.result())
+                    except UnprotectError as e:
+                        _record_error(row, e)
+                        stop = fail_fast
+                    except Exception as e:
+                        _record_error(row, e, unexpected=True)
+                        stop = fail_fast
+                    done += 1
+                    self._q.put(("progress", done / total, f"{done}/{total}"))
+                    if stop:
+                        self._q.put(("log", "Fail-fast: cancelling remaining files.", "warn"))
+                        for f in fut_to_path:
+                            f.cancel()
+                        break
+        else:
+            # ── Sequential path ────────────────────────────────────────────
+            for i, row in enumerate(rows):
+                self._q.put(("progress", i / total, f"{i}/{total}"))
+                self._q.put(("row", row, "running", "processing..."))
+                try:
+                    fn, kwargs = _call_for(row.path)
+                    _record(row, fn(**kwargs))
+                except UnprotectError as e:
+                    _record_error(row, e)
+                    if fail_fast:
+                        self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
+                        break
+                except Exception as e:
+                    _record_error(row, e, unexpected=True)
+                    if fail_fast:
+                        self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
+                        break
 
         # Batch summary
         if total > 1:
@@ -1044,6 +1136,7 @@ class UnprotectApp(ctk.CTk):
                     _, row, status, message = msg
                     if row.winfo_exists():
                         row.set_status(status, message)
+                        self._refresh_stats()
                 elif kind == "progress":
                     self._progress.set(msg[1])
                     self._prog_lbl.configure(text=msg[2])

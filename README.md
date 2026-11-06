@@ -123,6 +123,12 @@ If none of these are given and the file turns out to be encrypted, you'll be pro
 | `--verbose`, `-v` | Show which XML elements were removed, which files were rewritten, etc. |
 | `--quiet`, `-q` | Suppress all output except errors (useful for scripting) |
 
+### Misc
+
+| Flag | Description |
+|---|---|
+| `--version` | Print the program version and exit |
+
 ---
 
 ## Examples
@@ -232,9 +238,9 @@ Modern Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives containing XML.
 
 **Layer 1 — file encryption** (password required to open): handled by `msoffcrypto-tool`, which decrypts the file into a temporary copy before any further processing.
 
-**Layer 2 — edit/structure protection** (file opens fine, but editing is locked): handled by direct XML manipulation via `lxml`. The relevant protection elements (`documentProtection`, `writeProtection`, `readOnlyRecommended`, `workbookProtection`, `sheetProtection`, `modifyVerifier`) are removed from the XML inside the ZIP, rewriting only those entries while preserving compression and metadata for everything else. Digital signature entries are also removed where detected.
+**Layer 2 — edit/structure protection** (file opens fine, but editing is locked): handled by direct XML manipulation via `lxml`. The relevant protection elements (`documentProtection`, `writeProtection`, `readOnlyRecommended`, `workbookProtection`, `sheetProtection`, `modifyVerifier`) are removed from the XML inside the ZIP, rewriting only those entries while preserving compression and metadata for everything else. All affected parts are rewritten in a **single pass** over the archive, so a workbook with many protected sheets is repacked once rather than once per sheet. Digital signature entries are also removed where detected.
 
-For PDFs, `pypdf` handles decryption, reconstruction, removal of redaction annotations, JavaScript actions, and form restrictions. PDFs with only an owner password (print/edit restrictions, but no open password) are unlocked automatically without needing `--password`.
+For PDFs, `pypdf` handles decryption, reconstruction, removal of redaction annotations, JavaScript actions, and form restrictions. Document metadata (title, author, etc.) is carried over to the cleaned file. PDFs with only an owner password (print/edit restrictions, but no open password) are unlocked automatically without needing `--password`.
 
 **Legacy formats** (`.doc`, `.xls`, `.ppt`) are binary formats that do not contain XML. File-level decryption is supported via `msoffcrypto-tool`. To also strip edit locks, use `--convert` to have LibreOffice convert the file to the equivalent modern format first.
 
@@ -302,6 +308,25 @@ except UnprotectError as e:
 **`--convert` rejected with `--check`** — conversion cannot be performed in dry-run mode; remove `--check` to proceed
 
 **`--output` rejected with multiple files** — `--output` only works for a single file; use `--output-dir` for batch jobs or omit it to get the default `unlocked_<filename>` naming
+
+---
+
+## Desktop GUI
+
+A graphical front-end exposing every CLI feature is included in `unprotect_gui.py`.
+
+```bash
+pip install customtkinter CTkSpinbox   # in addition to the core dependencies
+python unprotect_gui.py                # run from the same directory as unprotect.py
+```
+
+Features:
+
+- **Files** tab — add files via a glob pattern (press <kbd>Enter</kbd> to add) or the file browser, with per-file status pills.
+- **Password** tab — no password / direct entry / password file / wordlist (brute-force), mirroring the CLI.
+- **Output** tab — output directory, in-place (with optional `.bak` backup), or an explicit single-file path, plus the safety flags.
+- **Advanced** tab — fail-fast, log verbosity, legacy `--convert`, and **parallel workers** (`--jobs`): set this above `1` and files are processed concurrently across worker processes.
+- A live **summary** bar (unlocked / open / protected / skipped / failed / queued) and a colour-coded output log.
 
 ---
 
