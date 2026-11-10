@@ -313,20 +313,20 @@ except UnprotectError as e:
 
 ## Desktop GUI
 
-A graphical front-end exposing every CLI feature is included in `unprotect_gui.py`.
+A native desktop front-end built with **PyQt6**, exposing every CLI feature, is included in `unprotect_gui.py`.
 
 ```bash
-pip install customtkinter CTkSpinbox   # in addition to the core dependencies
-python unprotect_gui.py                # run from the same directory as unprotect.py
+pip install PyQt6                       # in addition to the core dependencies
+python unprotect_gui.py                 # run from the same directory as unprotect.py
 ```
 
-Features:
+The window is a single working surface — the file queue on the left, all settings on the right, actions and a colour-coded log along the bottom — so nothing is buried behind tabs.
 
-- **Files** tab — add files via a glob pattern (press <kbd>Enter</kbd> to add) or the file browser, with per-file status pills.
-- **Password** tab — no password / direct entry / password file / wordlist (brute-force), mirroring the CLI.
-- **Output** tab — output directory, in-place (with optional `.bak` backup), or an explicit single-file path, plus the safety flags.
-- **Advanced** tab — fail-fast, log verbosity, legacy `--convert`, and **parallel workers** (`--jobs`): set this above `1` and files are processed concurrently across worker processes.
-- A live **summary** bar (unlocked / open / protected / skipped / failed / queued) and a colour-coded output log.
+- **Queue** — drag files straight onto the window, add them with the file browser, or expand a glob pattern (press <kbd>Enter</kbd>, optionally recursive). Each file carries a type badge and a live status pill.
+- **Password** — no password / direct entry / password file / wordlist (brute-force), mirroring the CLI; only the relevant field is shown.
+- **Output** — output directory, in-place (with optional `.bak` backup), or an explicit single-file path, plus the safety flags.
+- **Advanced** — log verbosity, fail-fast, legacy `--convert`, and **parallel workers** (`--jobs`): set this above `1` and files are processed concurrently across worker processes.
+- A live **summary** of counts (unlocked / open / protected / skipped / failed / queued) and a copyable output log.
 
 ---
 
