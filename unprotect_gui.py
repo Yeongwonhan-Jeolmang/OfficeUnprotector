@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-unprotect_gui.py — Full-featured GUI for unprotect.py
-All CLI features exposed: password/password-file/password-list, output/output-dir/in-place,
-backup, no-overwrite, fail-fast, check/dry-run, JSON export, glob/recursive input,
-verbose/quiet log, per-file status, plus new: parallel jobs (--jobs) and conversion (--convert).
+unprotect_gui.py — PyQt6 desktop front-end for unprotect.py
 
-Requires:  pip install customtkinter pypdf msoffcrypto-tool lxml CTkSpinbox
-Place in the same directory as unprotect.py and run:  python unprotect_gui.py
+Exposes every CLI feature: password / password-file / wordlist, output-dir /
+in-place / explicit-path, backup, no-overwrite, fail-fast, check (dry-run),
+JSON export, glob / recursive input, verbosity, parallel jobs (--jobs) and
+legacy conversion (--convert).
+
+Requires:  pip install PyQt6 pypdf msoffcrypto-tool lxml
+Place alongside unprotect.py and run:  python unprotect_gui.py
 """
 
 from __future__ import annotations
@@ -14,23 +16,22 @@ from __future__ import annotations
 import glob
 import json
 import os
-import queue
+import shutil
 import sys
-import threading
-import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, StringVar, filedialog, messagebox
-from CTkSpinbox import CTkSpinbox
-import tkinter as tk
 
-try:
-    import customtkinter as ctk
-except ImportError:
-    print("Missing: pip install customtkinter")
-    sys.exit(1)
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QGuiApplication
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
+    QLineEdit, QCheckBox, QRadioButton, QButtonGroup, QSpinBox, QComboBox,
+    QFileDialog, QMessageBox, QScrollArea, QSplitter, QGroupBox,
+    QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout, QPlainTextEdit,
+    QProgressBar, QSizePolicy,
+)
 
-# ── Import unprotect library ─────────────────────────────────────────────────
+# ── Import the unprotect library ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from unprotect import (
@@ -41,308 +42,375 @@ try:
 except ImportError:
     _HAVE_LIB = False
 
+    class UnprotectError(Exception):  # fallback so the window still builds
+        code = 1
+
+
 # ── Palette ──────────────────────────────────────────────────────────────────
-BG       = "#0b0d12"
-SURFACE  = "#13161e"
-CARD     = "#1a1e2a"
-CARD2    = "#1f2435"
-BORDER   = "#252c3f"
-ACCENT   = "#4f7ef8"
-ACCENT_H = "#3563d4"
-SUCCESS  = "#2ecc8f"
-ERROR    = "#e05c5c"
-WARN     = "#e8a838"
-INFO     = "#7eb8f7"
-TEXT     = "#dde1ef"
-TEXT_DIM = "#5a627f"
-MONO     = ("Courier New", 11)
+BG       = "#15171c"
+SURFACE  = "#1c1f27"
+ELEVATED = "#232733"
+BORDER   = "#2f3340"
+ACCENT   = "#5b8cff"
+ACCENT_H = "#6f9bff"
+ACCENT_D = "#3f6ad6"
+TEXT     = "#e7e9f0"
+MUTED    = "#8b92a6"
+FAINT    = "#5c6378"
+SUCCESS  = "#4fc38a"
+WARN     = "#e3a93c"
+ERROR    = "#e86374"
+INFO     = "#73a9f2"
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
-
-# ── Status colours ───────────────────────────────────────────────────────────
 STATUS_COLOR = {
     "unlocked":  SUCCESS,
     "open":      INFO,
     "protected": WARN,
     "failed":    ERROR,
-    "skipped":   TEXT_DIM,
-    "pending":   TEXT_DIM,
+    "skipped":   MUTED,
+    "pending":   FAINT,
     "running":   ACCENT,
 }
 
 EXT_LABEL = {
-    "pdf": "PDF", "xlsx": "XLS", "xlsm": "XLS",
-    "xls": "XLS", "docx": "DOC", "doc": "DOC",
-    "pptx": "PPT", "ppt": "PPT",
+    "pdf": "PDF", "xlsx": "XLSX", "xlsm": "XLSM", "xls": "XLS",
+    "docx": "DOCX", "doc": "DOC", "pptx": "PPTX", "ppt": "PPT",
 }
+SUPPORTED_EXTS = {".pdf", ".xlsx", ".xlsm", ".xls", ".docx", ".doc", ".pptx", ".ppt"}
+
 
 def _badge(path: str) -> str:
-    return EXT_LABEL.get(Path(path).suffix.lstrip(".").lower(), "???")
+    return EXT_LABEL.get(Path(path).suffix.lstrip(".").lower(), "FILE")
+
+
+# ── Global stylesheet ────────────────────────────────────────────────────────
+STYLESHEET = f"""
+QWidget {{
+    background-color: {BG};
+    color: {TEXT};
+    font-family: "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+}}
+QLabel#Title {{ font-size: 18px; font-weight: 700; letter-spacing: 0.5px; }}
+QLabel#Subtitle {{ color: {MUTED}; font-size: 11px; letter-spacing: 1px; }}
+QLabel#Hint {{ color: {MUTED}; font-size: 11px; }}
+QLabel#Warn {{ color: {WARN}; font-size: 11px; }}
+
+QFrame#Header, QFrame#ActionBar {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+
+QGroupBox {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    margin-top: 14px;
+    padding: 10px 12px 12px 12px;
+    font-weight: 600;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 4px;
+    color: {MUTED};
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}}
+
+QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {{
+    background-color: {ELEVATED};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    padding: 6px 9px;
+    selection-background-color: {ACCENT};
+    selection-color: {BG};
+}}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {ACCENT}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox QAbstractItemView {{
+    background-color: {ELEVATED};
+    border: 1px solid {BORDER};
+    selection-background-color: {ACCENT};
+    selection-color: {BG};
+    outline: none;
+}}
+
+QPushButton {{
+    background-color: {ELEVATED};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    padding: 7px 14px;
+    color: {TEXT};
+}}
+QPushButton:hover {{ border: 1px solid {ACCENT}; }}
+QPushButton:pressed {{ background-color: {BORDER}; }}
+QPushButton:disabled {{ color: {FAINT}; border-color: {BORDER}; }}
+
+QPushButton#Primary {{
+    background-color: {ACCENT};
+    border: none;
+    color: #ffffff;
+    font-weight: 700;
+}}
+QPushButton#Primary:hover {{ background-color: {ACCENT_H}; }}
+QPushButton#Primary:pressed {{ background-color: {ACCENT_D}; }}
+QPushButton#Primary:disabled {{ background-color: {BORDER}; color: {FAINT}; }}
+
+QPushButton#Ghost {{
+    background-color: transparent;
+    border: none;
+    color: {MUTED};
+    padding: 4px 8px;
+}}
+QPushButton#Ghost:hover {{ color: {TEXT}; }}
+
+QCheckBox, QRadioButton {{ spacing: 7px; }}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 16px; height: 16px;
+    border: 1px solid {BORDER};
+    background-color: {ELEVATED};
+}}
+QCheckBox::indicator {{ border-radius: 4px; }}
+QRadioButton::indicator {{ border-radius: 9px; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background-color: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+QRadioButton:disabled, QCheckBox:disabled {{ color: {FAINT}; }}
+
+QProgressBar {{
+    background-color: {ELEVATED};
+    border: none;
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+}}
+QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 4px; }}
+
+QScrollArea {{ border: none; background: transparent; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-height: 30px; }}
+QScrollBar::handle:vertical:hover {{ background: {ACCENT_D}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ background: {BORDER}; border-radius: 5px; min-width: 30px; }}
+
+QSplitter::handle {{ background: transparent; }}
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Widgets
+# File row
 # ─────────────────────────────────────────────────────────────────────────────
+class FileRow(QFrame):
+    remove_requested = pyqtSignal(object)
 
-class SectionLabel(ctk.CTkLabel):
-    def __init__(self, master, text, **kw):
-        super().__init__(master, text=text,
-                         font=ctk.CTkFont("Courier New", 9, "bold"),
-                         text_color=TEXT_DIM, **kw)
-
-
-class FileRow(ctk.CTkFrame):
-    def __init__(self, master, path: str, on_remove, **kw):
-        super().__init__(master, fg_color=CARD, corner_radius=7,
-                         border_width=1, border_color=BORDER, **kw)
+    def __init__(self, path: str):
+        super().__init__()
         self.path = path
         self._status = "pending"
-        self._status_var = StringVar(value="pending")
-        self._msg_var    = StringVar(value="waiting...")
-        self.columnconfigure(1, weight=1)
+        self.setObjectName("FileRow")
+        self.setStyleSheet(
+            f"#FileRow {{ background-color: {ELEVATED}; border: 1px solid {BORDER};"
+            f" border-radius: 8px; }}"
+        )
 
-        badge = ctk.CTkLabel(self, text=_badge(path), width=40, height=26,
-                             font=ctk.CTkFont("Courier New", 10, "bold"),
-                             fg_color=BORDER, corner_radius=5, text_color=ACCENT)
-        badge.grid(row=0, column=0, padx=(9, 7), pady=8)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 8, 8, 8)
+        lay.setSpacing(10)
 
-        info = ctk.CTkFrame(self, fg_color="transparent")
-        info.grid(row=0, column=1, sticky="ew")
-        info.columnconfigure(0, weight=1)
-        ctk.CTkLabel(info, text=Path(path).name,
-                     font=ctk.CTkFont("Courier New", 11, "bold"),
-                     text_color=TEXT, anchor="w").grid(row=0, column=0, sticky="ew")
-        self._msg_lbl = ctk.CTkLabel(info, textvariable=self._msg_var,
-                                      font=ctk.CTkFont("Courier New", 9),
-                                      text_color=TEXT_DIM, anchor="w")
-        self._msg_lbl.grid(row=1, column=0, sticky="ew")
+        self._badge = QLabel(_badge(path))
+        self._badge.setFixedWidth(46)
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge.setStyleSheet(
+            f"background-color: {BORDER}; color: {ACCENT}; border-radius: 5px;"
+            f" padding: 4px 0; font-weight: 700; font-size: 10px;"
+        )
+        lay.addWidget(self._badge)
 
-        self._pill = ctk.CTkLabel(self, textvariable=self._status_var,
-                                   width=76, height=22,
-                                   font=ctk.CTkFont("Courier New", 9, "bold"),
-                                   fg_color=BORDER, corner_radius=11,
-                                   text_color=TEXT_DIM)
-        self._pill.grid(row=0, column=2, padx=6)
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        self._name = QLabel(Path(path).name)
+        self._name.setStyleSheet("font-weight: 600;")
+        self._name.setToolTip(path)
+        self._msg = QLabel("waiting")
+        self._msg.setStyleSheet(f"color: {FAINT}; font-size: 11px;")
+        info.addWidget(self._name)
+        info.addWidget(self._msg)
+        lay.addLayout(info, 1)
 
-        ctk.CTkButton(self, text="X", width=26, height=26,
-                      fg_color="transparent", hover_color=BORDER,
-                      text_color=TEXT_DIM, font=ctk.CTkFont("Courier New", 11),
-                      command=lambda: on_remove(self)).grid(row=0, column=3, padx=(0, 7))
+        self._pill = QLabel("pending")
+        self._pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pill.setFixedHeight(22)
+        self._pill.setMinimumWidth(78)
+        self._style_pill(FAINT)
+        lay.addWidget(self._pill)
+
+        close = QPushButton("✕")
+        close.setObjectName("Ghost")
+        close.setFixedSize(26, 26)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(lambda: self.remove_requested.emit(self))
+        lay.addWidget(close)
+
+    def _style_pill(self, color: str):
+        self._pill.setStyleSheet(
+            f"color: {color}; border: 1px solid {color}; border-radius: 11px;"
+            f" padding: 2px 10px; font-size: 10px; font-weight: 700;"
+        )
 
     def set_status(self, status: str, msg: str = ""):
         self._status = status
-        self._status_var.set(status)
-        self._msg_var.set(msg)
-        c = STATUS_COLOR.get(status, TEXT_DIM)
-        self._pill.configure(text_color=c)
-        self._msg_lbl.configure(text_color=c if status != "pending" else TEXT_DIM)
+        self._pill.setText(status)
+        c = STATUS_COLOR.get(status, FAINT)
+        self._style_pill(c)
+        if msg:
+            self._msg.setText(msg)
+        self._msg.setStyleSheet(
+            f"color: {c if status not in ('pending', 'running') else FAINT};"
+            f" font-size: 11px;"
+        )
 
     @property
     def status(self) -> str:
         return self._status
 
 
-class LogPanel(ctk.CTkFrame):
-    LEVELS = {"debug": TEXT_DIM, "info": TEXT, "ok": SUCCESS,
-              "warn": WARN, "err": ERROR, "json": INFO}
-
-    def __init__(self, master, **kw):
-        super().__init__(master, fg_color=SURFACE, corner_radius=8,
-                         border_width=1, border_color=BORDER, **kw)
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=10, pady=(8, 2))
-        SectionLabel(top, text="OUTPUT LOG").pack(side="left")
-        ctk.CTkButton(top, text="Copy", width=44, height=20,
-                      fg_color="transparent", hover_color=BORDER,
-                      font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM,
-                      command=self._copy).pack(side="right")
-        ctk.CTkButton(top, text="Clear", width=44, height=20,
-                      fg_color="transparent", hover_color=BORDER,
-                      font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM,
-                      command=self.clear).pack(side="right", padx=(0, 2))
-
-        self._text = tk.Text(self, bg=SURFACE, fg=TEXT, insertbackground=TEXT,
-                             font=MONO, relief="flat", bd=0, wrap="word",
-                             state="disabled", height=9,
-                             selectbackground=ACCENT, selectforeground=BG)
-        self._text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        for name, color in self.LEVELS.items():
-            self._text.tag_configure(name, foreground=color)
-        self._text.tag_configure("ts", foreground=TEXT_DIM)
-
-    def append(self, text: str, level: str = "info"):
-        self._text.configure(state="normal")
-        ts = time.strftime("%H:%M:%S")
-        self._text.insert("end", f"[{ts}] ", "ts")
-        self._text.insert("end", text + "\n", level)
-        self._text.see("end")
-        self._text.configure(state="disabled")
-
-    def clear(self):
-        self._text.configure(state="normal")
-        self._text.delete("1.0", "end")
-        self._text.configure(state="disabled")
-
-    def _copy(self):
-        content = self._text.get("1.0", "end")
-        self.clipboard_clear()
-        self.clipboard_append(content)
-
-
-class StatsBar(ctk.CTkFrame):
-    """A compact row of coloured count chips summarising file statuses."""
-
-    ORDER = [("unlocked", "unlocked"), ("open", "open"), ("protected", "protected"),
-             ("skipped", "skipped"), ("failed", "failed"), ("pending", "queued")]
-
-    def __init__(self, master, **kw):
-        super().__init__(master, fg_color=SURFACE, corner_radius=8,
-                         border_width=1, border_color=BORDER, **kw)
-        self._chips: dict[str, ctk.CTkLabel] = {}
-        inner = ctk.CTkFrame(self, fg_color="transparent")
-        inner.pack(fill="x", padx=10, pady=7)
-        SectionLabel(inner, text="SUMMARY").pack(side="left", padx=(0, 10))
-        for key, label in self.ORDER:
-            chip = ctk.CTkLabel(
-                inner, text=f"0 {label}", height=22,
-                font=ctk.CTkFont("Courier New", 9, "bold"),
-                fg_color=CARD, corner_radius=11, text_color=TEXT_DIM,
-                padx=10)
-            chip.pack(side="left", padx=3)
-            self._chips[key] = chip
-
-    def update_counts(self, counts: dict[str, int]):
-        for key, label in self.ORDER:
-            n = counts.get(key, 0)
-            chip = self._chips[key]
-            color = STATUS_COLOR.get(key, TEXT_DIM)
-            # Light up a chip only when it has a non-zero count.
-            chip.configure(text=f"{n} {label}",
-                           text_color=color if n else TEXT_DIM,
-                           fg_color=CARD2 if n else CARD)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab: Files
+# Input panel (files)
 # ─────────────────────────────────────────────────────────────────────────────
+class InputPanel(QWidget):
+    changed = pyqtSignal()
 
-class InputTab(ctk.CTkFrame):
-    def __init__(self, master, app, **kw):
-        super().__init__(master, fg_color="transparent", **kw)
-        self.app = app
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+    def __init__(self):
+        super().__init__()
+        self._rows: list[FileRow] = []
         self._build()
 
     def _build(self):
-        # Glob entry
-        glob_frame = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8,
-                                  border_width=1, border_color=BORDER)
-        glob_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        glob_frame.columnconfigure(1, weight=1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(10)
 
-        SectionLabel(glob_frame, text="GLOB PATTERN / PATH").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
+        # Glob row
+        glob_box = QGroupBox("Add files")
+        gl = QGridLayout(glob_box)
+        gl.setContentsMargins(12, 16, 12, 12)
+        gl.setSpacing(8)
 
-        self._glob_var = StringVar()
-        glob_entry = ctk.CTkEntry(glob_frame, textvariable=self._glob_var,
-                     placeholder_text="e.g.  *.xlsx  or  /docs/**/*.pdf   (press Enter to add)",
-                     font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER, text_color=TEXT)
-        glob_entry.grid(row=1, column=0, columnspan=2, sticky="ew",
-                        padx=(12, 6), pady=(0, 8))
-        glob_entry.bind("<Return>", lambda _e: self._expand_glob())
+        self._glob = QLineEdit()
+        self._glob.setPlaceholderText("glob or path, e.g.  *.xlsx  —  press Enter to add")
+        self._glob.returnPressed.connect(self._expand_glob)
+        gl.addWidget(self._glob, 0, 0, 1, 2)
 
-        self._recursive_var = BooleanVar()
-        ctk.CTkCheckBox(glob_frame, text="Recursive (**)",
-                        variable=self._recursive_var,
-                        font=ctk.CTkFont("Courier New", 10),
-                        text_color=TEXT, fg_color=ACCENT, width=16,
-                        ).grid(row=1, column=2, padx=(0, 6))
+        self._recursive = QCheckBox("Recursive (**)")
+        gl.addWidget(self._recursive, 0, 2)
 
-        ctk.CTkButton(glob_frame, text="Expand & Add", height=30, width=110,
-                      font=ctk.CTkFont("Courier New", 10, "bold"),
-                      fg_color=ACCENT, hover_color=ACCENT_H,
-                      command=self._expand_glob,
-                      ).grid(row=1, column=3, padx=(0, 12), pady=(0, 8))
+        add_btn = QPushButton("Expand")
+        add_btn.clicked.connect(self._expand_glob)
+        gl.addWidget(add_btn, 0, 3)
 
-        # File list
-        list_card = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=8,
-                                 border_width=1, border_color=BORDER)
-        list_card.grid(row=1, column=0, sticky="nsew")
-        list_card.columnconfigure(0, weight=1)
-        list_card.rowconfigure(1, weight=1)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        gl.addWidget(browse, 1, 2)
 
-        hdr = ctk.CTkFrame(list_card, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
-        SectionLabel(hdr, text="FILES").pack(side="left")
-        ctk.CTkButton(hdr, text="Browse...", height=26, width=70,
-                      font=ctk.CTkFont("Courier New", 10),
-                      fg_color=ACCENT, hover_color=ACCENT_H,
-                      command=self._browse).pack(side="right")
-        ctk.CTkButton(hdr, text="Clear all", height=26, width=66,
-                      fg_color="transparent", hover_color=BORDER,
-                      font=ctk.CTkFont("Courier New", 10), text_color=TEXT_DIM,
-                      command=self.clear_all).pack(side="right", padx=(0, 4))
+        clear = QPushButton("Clear all")
+        clear.setObjectName("Ghost")
+        clear.clicked.connect(self.clear_all)
+        gl.addWidget(clear, 1, 3)
+        gl.setColumnStretch(0, 1)
+        outer.addWidget(glob_box)
 
-        self._scroll = ctk.CTkScrollableFrame(list_card, fg_color="transparent",
-                                              scrollbar_button_color=BORDER,
-                                              scrollbar_button_hover_color=ACCENT)
-        self._scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        self._scroll.columnconfigure(0, weight=1)
+        # File list (drop target)
+        list_box = QGroupBox("Queue")
+        lv = QVBoxLayout(list_box)
+        lv.setContentsMargins(10, 16, 10, 10)
 
-        self._rows: list[FileRow] = []
-        self._empty_lbl = ctk.CTkLabel(self._scroll,
-            text="No files yet. Browse or enter a glob pattern above.",
-            font=ctk.CTkFont("Courier New", 10), text_color=TEXT_DIM)
-        self._empty_lbl.grid(row=0, column=0, pady=30)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setAcceptDrops(True)
+        self._scroll.installEventFilter(self)  # not strictly needed; DnD on self
 
+        self._list_host = QWidget()
+        self._list_lay = QVBoxLayout(self._list_host)
+        self._list_lay.setContentsMargins(2, 2, 2, 2)
+        self._list_lay.setSpacing(6)
+        self._list_lay.addStretch(1)
+
+        self._empty = QLabel("Drop files here, browse, or expand a glob pattern.")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setStyleSheet(f"color: {FAINT}; padding: 40px;")
+        self._list_lay.insertWidget(0, self._empty)
+
+        self._scroll.setWidget(self._list_host)
+        lv.addWidget(self._scroll)
+        outer.addWidget(list_box, 1)
+
+        # enable drag & drop on the whole panel
+        self.setAcceptDrops(True)
+
+    # ── Drag & drop ──────────────────────────────────────────────────────────
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        added = 0
+        for url in e.mimeData().urls():
+            p = url.toLocalFile()
+            if p and os.path.isfile(p):
+                before = len(self._rows)
+                self.add_file(p)
+                added += len(self._rows) - before
+        if added:
+            e.acceptProposedAction()
+
+    # ── Actions ──────────────────────────────────────────────────────────────
     def _browse(self):
-        paths = filedialog.askopenfilenames(
-            title="Select files",
-            filetypes=[("Supported", "*.pdf *.xlsx *.xlsm *.xls *.docx *.doc *.pptx *.ppt"),
-                       ("All", "*.*")])
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select files", "",
+            "Supported (*.pdf *.xlsx *.xlsm *.xls *.docx *.doc *.pptx *.ppt);;All files (*.*)")
         for p in paths:
             self.add_file(p)
 
     def _expand_glob(self):
-        pattern = self._glob_var.get().strip()
+        pattern = self._glob.text().strip()
         if not pattern:
             return
-        expanded = glob.glob(pattern, recursive=self._recursive_var.get())
-        if not expanded:
-            messagebox.showwarning("No matches", f"No files matched:\n{pattern}")
+        matches = glob.glob(pattern, recursive=self._recursive.isChecked())
+        files = [p for p in matches if os.path.isfile(p)]
+        if not files:
+            QMessageBox.warning(self, "No matches", f"No files matched:\n{pattern}")
             return
-        added = 0
-        for p in expanded:
-            if os.path.isfile(p):
-                self.add_file(p)
-                added += 1
-        self.app.log(f"Glob '{pattern}' -> {added} file(s) added.", "info")
-        self._glob_var.set("")
+        for p in files:
+            self.add_file(p)
+        self._glob.clear()
 
     def add_file(self, path: str):
         if any(r.path == path for r in self._rows):
             return
-        if hasattr(self, '_empty_lbl') and self._empty_lbl.winfo_exists():
-            self._empty_lbl.grid_forget()
-        row = FileRow(self._scroll, path, on_remove=self._remove)
-        row.grid(row=len(self._rows), column=0, sticky="ew", pady=(0, 5))
+        self._empty.hide()
+        row = FileRow(path)
+        row.remove_requested.connect(self._remove)
+        # insert before the trailing stretch
+        self._list_lay.insertWidget(self._list_lay.count() - 1, row)
         self._rows.append(row)
-        self.app._refresh_stats()
+        self.changed.emit()
 
     def _remove(self, row: FileRow):
-        row.destroy()
+        if row not in self._rows:
+            return
         self._rows.remove(row)
-        for i, r in enumerate(self._rows):
-            r.grid(row=i, column=0, sticky="ew", pady=(0, 5))
+        row.setParent(None)
+        row.deleteLater()
         if not self._rows:
-            self._empty_lbl = ctk.CTkLabel(self._scroll,
-                text="No files yet. Browse or enter a glob pattern above.",
-                font=ctk.CTkFont("Courier New", 10), text_color=TEXT_DIM)
-            self._empty_lbl.grid(row=0, column=0, pady=30)
-        self.app._refresh_stats()
+            self._empty.show()
+        self.changed.emit()
 
     def clear_all(self):
         for r in list(self._rows):
@@ -354,514 +422,653 @@ class InputTab(ctk.CTkFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab: Password
+# Password panel
 # ─────────────────────────────────────────────────────────────────────────────
-
-class PasswordTab(ctk.CTkFrame):
-    """Mutually exclusive: no password | direct | password-file | wordlist brute-force."""
-
-    def __init__(self, master, **kw):
-        super().__init__(master, fg_color="transparent", **kw)
-        self.columnconfigure(0, weight=1)
-        self._mode = StringVar(value="none")
+class PasswordPanel(QGroupBox):
+    def __init__(self):
+        super().__init__("Password")
         self._build()
 
     def _build(self):
-        def _card():
-            f = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8,
-                             border_width=1, border_color=BORDER)
-            f.columnconfigure(1, weight=1)
-            return f
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 18, 12, 12)
+        lay.setSpacing(8)
 
-        # Mode selector
-        mode_card = _card()
-        mode_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(mode_card, text="PASSWORD SOURCE").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 6))
+        self._mode = QComboBox()
+        self._mode.addItem("No password", "none")
+        self._mode.addItem("Type a password", "direct")
+        self._mode.addItem("Password file (first line)", "file")
+        self._mode.addItem("Wordlist — brute force", "list")
+        self._mode.currentIndexChanged.connect(self._refresh)
+        lay.addWidget(self._mode)
 
-        for col, (val, lbl) in enumerate([("none",   "No password"),
-                                          ("direct", "Type password"),
-                                          ("file",   "Password file"),
-                                          ("list",   "Wordlist (brute-force)")]):
-            ctk.CTkRadioButton(mode_card, text=lbl, variable=self._mode,
-                               value=val, command=self._refresh,
-                               font=ctk.CTkFont("Courier New", 11),
-                               text_color=TEXT, fg_color=ACCENT,
-                               ).grid(row=1, column=col, padx=(12, 0), pady=(0, 10))
+        # direct
+        self._pw = QLineEdit()
+        self._pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw.setPlaceholderText("password")
+        self._show = QCheckBox("Show")
+        self._show.toggled.connect(
+            lambda on: self._pw.setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        row = QHBoxLayout()
+        row.addWidget(self._pw, 1)
+        row.addWidget(self._show)
+        self._pw_wrap = self._wrap(row)
+        lay.addWidget(self._pw_wrap)
 
-        # Direct password
-        self._pw_card = _card()
-        self._pw_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._pw_card, text="PASSWORD").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 4))
+        # password file
+        self._pf = QLineEdit()
+        self._pf.setPlaceholderText("path/to/password.txt")
+        self._pf.setMinimumWidth(60)
+        self._pf_wrap = self._file_row(self._pf, "Password file")
+        lay.addWidget(self._pf_wrap)
 
-        self._pw_var = StringVar()
-        self._pw_entry = ctk.CTkEntry(self._pw_card, textvariable=self._pw_var,
-                                      show="*", placeholder_text="enter password",
-                                      font=ctk.CTkFont("Courier New", 11),
-                                      fg_color=CARD2, border_color=BORDER,
-                                      text_color=TEXT, width=260)
-        self._pw_entry.grid(row=1, column=0, padx=(12, 6), pady=(0, 10))
-
-        self._show_var = BooleanVar()
-        ctk.CTkCheckBox(self._pw_card, text="Show", variable=self._show_var,
-                        font=ctk.CTkFont("Courier New", 10),
-                        text_color=TEXT_DIM, fg_color=ACCENT,
-                        command=lambda: self._pw_entry.configure(
-                            show="" if self._show_var.get() else "*"),
-                        ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
-
-        # Password file
-        self._pf_card = _card()
-        self._pf_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._pf_card, text="PASSWORD FILE  (first line used)").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 4))
-
-        self._pf_var = StringVar()
-        ctk.CTkEntry(self._pf_card, textvariable=self._pf_var,
-                     placeholder_text="path/to/password.txt",
-                     font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER,
-                     text_color=TEXT).grid(row=1, column=0, sticky="ew",
-                                           padx=(12, 6), pady=(0, 10))
-        ctk.CTkButton(self._pf_card, text="...", width=30,
-                      fg_color=BORDER, hover_color=ACCENT,
-                      command=self._pick_pw_file,
-                      ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
-
-        # Wordlist
-        self._wl_card = _card()
-        self._wl_card.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._wl_card, text="WORDLIST  (one password per line — brute-force)").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 4))
-
-        self._wl_var = StringVar()
-        ctk.CTkEntry(self._wl_card, textvariable=self._wl_var,
-                     placeholder_text="path/to/wordlist.txt",
-                     font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER,
-                     text_color=TEXT).grid(row=1, column=0, sticky="ew",
-                                           padx=(12, 6), pady=(0, 10))
-        ctk.CTkButton(self._wl_card, text="...", width=30,
-                      fg_color=BORDER, hover_color=ACCENT,
-                      command=self._pick_wl_file,
-                      ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
+        # wordlist
+        self._wl = QLineEdit()
+        self._wl.setPlaceholderText("path/to/wordlist.txt")
+        self._wl.setMinimumWidth(60)
+        self._wl_wrap = self._file_row(self._wl, "Wordlist")
+        lay.addWidget(self._wl_wrap)
 
         self._refresh()
 
-    def _pick_pw_file(self):
-        p = filedialog.askopenfilename(title="Password file",
-                                       filetypes=[("Text", "*.txt"), ("All", "*.*")])
-        if p:
-            self._pf_var.set(p)
+    def _wrap(self, inner_layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(inner_layout)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        return w
 
-    def _pick_wl_file(self):
-        p = filedialog.askopenfilename(title="Wordlist file",
-                                       filetypes=[("Text", "*.txt"), ("All", "*.*")])
+    def _file_row(self, line: QLineEdit, title: str) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(line, 1)
+        btn = QPushButton("…")
+        btn.setFixedWidth(34)
+        btn.clicked.connect(lambda: self._pick(line, title))
+        row.addWidget(btn)
+        return self._wrap(row)
+
+    def _pick(self, line: QLineEdit, title: str):
+        p, _ = QFileDialog.getOpenFileName(self, title, "", "Text (*.txt);;All files (*.*)")
         if p:
-            self._wl_var.set(p)
+            line.setText(p)
 
     def _refresh(self):
-        m = self._mode.get()
-        self._pw_card.configure(border_color=ACCENT if m == "direct" else BORDER)
-        self._pf_card.configure(border_color=ACCENT if m == "file"   else BORDER)
-        self._wl_card.configure(border_color=ACCENT if m == "list"   else BORDER)
+        m = self.mode
+        self._pw_wrap.setVisible(m == "direct")
+        self._pf_wrap.setVisible(m == "file")
+        self._wl_wrap.setVisible(m == "list")
 
     @property
     def mode(self) -> str:
-        return self._mode.get()
+        return self._mode.currentData()
 
-    def get_password(self) -> str | None:
-        m = self.mode
-        if m == "none":
-            return None
-        if m == "direct":
-            return self._pw_var.get() or None
-        if m == "file":
-            return _load_password_file(self._pf_var.get())
-        return None  # wordlist handled separately in worker
+    @property
+    def password_file_path(self) -> str:
+        return self._pf.text().strip()
 
     @property
     def wordlist_path(self) -> str | None:
-        return self._wl_var.get().strip() or None
+        return self._wl.text().strip() or None
+
+    def get_password(self) -> str | None:
+        m = self.mode
+        if m == "direct":
+            return self._pw.text() or None
+        if m == "file":
+            return _load_password_file(self._pf.text().strip())
+        return None  # none / list handled elsewhere
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab: Output
+# Output panel
 # ─────────────────────────────────────────────────────────────────────────────
-
-class OutputTab(ctk.CTkFrame):
-    """Mutually exclusive output modes: output-dir | in-place | explicit path (single file)."""
-
-    def __init__(self, master, **kw):
-        super().__init__(master, fg_color="transparent", **kw)
-        self.columnconfigure(0, weight=1)
-        self._mode = StringVar(value="dir")
+class OutputPanel(QGroupBox):
+    def __init__(self):
+        super().__init__("Output")
         self._build()
 
     def _build(self):
-        def _card():
-            f = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8,
-                             border_width=1, border_color=BORDER)
-            f.columnconfigure(1, weight=1)
-            return f
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 18, 12, 12)
+        lay.setSpacing(8)
 
-        # Mode
-        mode_card = _card()
-        mode_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(mode_card, text="OUTPUT MODE").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 6))
-        for col, (val, lbl) in enumerate([("dir",     "Output directory"),
-                                          ("inplace", "In-place (overwrite original)"),
-                                          ("file",    "Explicit path  [single file only]")]):
-            ctk.CTkRadioButton(mode_card, text=lbl, variable=self._mode,
-                               value=val, command=self._refresh,
-                               font=ctk.CTkFont("Courier New", 11),
-                               text_color=TEXT, fg_color=ACCENT,
-                               ).grid(row=1, column=col, padx=(12, 0), pady=(0, 10))
+        self._mode = QComboBox()
+        self._mode.addItem("Output directory", "dir")
+        self._mode.addItem("In-place (overwrite original)", "inplace")
+        self._mode.addItem("Explicit path (single file)", "file")
+        self._mode.currentIndexChanged.connect(self._refresh)
+        lay.addWidget(self._mode)
 
-        # Output directory
-        self._dir_card = _card()
-        self._dir_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._dir_card,
-                     text="OUTPUT DIRECTORY  (blank = unlocked_<name>.ext in same folder)").grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
-        self._dir_var = StringVar()
-        ctk.CTkEntry(self._dir_card, textvariable=self._dir_var,
-                     placeholder_text="leave blank for same folder",
-                     font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER, text_color=TEXT,
-                     ).grid(row=1, column=0, sticky="ew", padx=(12, 6), pady=(0, 10))
-        ctk.CTkButton(self._dir_card, text="...", width=30,
-                      fg_color=BORDER, hover_color=ACCENT,
-                      command=lambda: self._dir_var.set(
-                          filedialog.askdirectory(title="Output directory") or self._dir_var.get()),
-                      ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
+        # output dir
+        self._dir = QLineEdit()
+        self._dir.setPlaceholderText("blank → unlocked_<name>.ext beside original")
+        self._dir.setMinimumWidth(60)
+        self._dir_wrap = self._file_row(self._dir, directory=True)
+        lay.addWidget(self._dir_wrap)
 
-        # In-place warning
-        self._ip_card = _card()
-        self._ip_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._ip_card, text="IN-PLACE").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 4))
-        ctk.CTkLabel(self._ip_card,
-                     text="The original file will be overwritten. Enable Backup (below) to keep a .bak copy.",
-                     font=ctk.CTkFont("Courier New", 10), text_color=WARN,
-                     wraplength=500, justify="left",
-                     ).grid(row=1, column=0, padx=12, pady=(0, 10), sticky="w")
+        # explicit file
+        self._file = QLineEdit()
+        self._file.setPlaceholderText("e.g.  ~/unlocked_report.pdf")
+        self._file.setMinimumWidth(60)
+        self._file_wrap = self._file_row(self._file, directory=False, save=True)
+        lay.addWidget(self._file_wrap)
 
-        # Explicit output file (single-file mode)
-        self._file_card = _card()
-        self._file_card.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(self._file_card,
-                     text="OUTPUT FILE PATH  (single-file mode only)").grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
-        self._file_var = StringVar()
-        ctk.CTkEntry(self._file_card, textvariable=self._file_var,
-                     placeholder_text="e.g.  /home/user/unlocked_report.pdf",
-                     font=ctk.CTkFont("Courier New", 11),
-                     fg_color=CARD2, border_color=BORDER, text_color=TEXT,
-                     ).grid(row=1, column=0, sticky="ew", padx=(12, 6), pady=(0, 10))
-        ctk.CTkButton(self._file_card, text="...", width=30,
-                      fg_color=BORDER, hover_color=ACCENT,
-                      command=lambda: self._file_var.set(
-                          filedialog.asksaveasfilename(title="Output file") or self._file_var.get()),
-                      ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
+        # inplace note
+        self._ip_note = QLabel("Original is overwritten. Enable backup below to keep a .bak copy.")
+        self._ip_note.setObjectName("Warn")
+        self._ip_note.setWordWrap(True)
+        lay.addWidget(self._ip_note)
 
-        # Safety options
-        safe_card = _card()
-        safe_card.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(safe_card, text="SAFETY OPTIONS").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 6))
-        self._backup_var = BooleanVar()
-        self._noover_var = BooleanVar()
-        ctk.CTkCheckBox(safe_card,
-                        text="Backup (.bak) before overwriting  [requires In-place mode]",
-                        variable=self._backup_var,
-                        font=ctk.CTkFont("Courier New", 11),
-                        text_color=TEXT, fg_color=ACCENT,
-                        ).grid(row=1, column=0, padx=(12, 20), pady=(0, 10))
-        ctk.CTkCheckBox(safe_card,
-                        text="Skip if output file already exists",
-                        variable=self._noover_var,
-                        font=ctk.CTkFont("Courier New", 11),
-                        text_color=TEXT, fg_color=ACCENT,
-                        ).grid(row=1, column=1, padx=(0, 12), pady=(0, 10))
+        # safety
+        self._backup = QCheckBox("Backup (.bak) before overwriting")
+        self._no_over = QCheckBox("Skip if output already exists")
+        lay.addWidget(self._backup)
+        lay.addWidget(self._no_over)
 
         self._refresh()
 
+    def _file_row(self, line: QLineEdit, directory: bool, save: bool = False) -> QWidget:
+        w = QWidget()
+        row = QHBoxLayout(w)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(line, 1)
+        btn = QPushButton("…")
+        btn.setFixedWidth(34)
+        btn.clicked.connect(lambda: self._pick(line, directory, save))
+        row.addWidget(btn)
+        return w
+
+    def _pick(self, line: QLineEdit, directory: bool, save: bool):
+        if directory:
+            p = QFileDialog.getExistingDirectory(self, "Output directory")
+        elif save:
+            p, _ = QFileDialog.getSaveFileName(self, "Output file")
+        else:
+            p, _ = QFileDialog.getOpenFileName(self, "Select")
+        if p:
+            line.setText(p)
+
     def _refresh(self):
-        m = self._mode.get()
-        self._dir_card.configure( border_color=ACCENT if m == "dir"     else BORDER)
-        self._ip_card.configure(  border_color=ACCENT if m == "inplace" else BORDER)
-        self._file_card.configure(border_color=ACCENT if m == "file"    else BORDER)
+        m = self.mode
+        self._dir_wrap.setVisible(m == "dir")
+        self._file_wrap.setVisible(m == "file")
+        self._ip_note.setVisible(m == "inplace")
+        self._backup.setEnabled(m == "inplace")
 
     @property
     def mode(self) -> str:
-        return self._mode.get()
+        return self._mode.currentData()
 
     @property
     def output_dir(self) -> str | None:
-        return self._dir_var.get().strip() or None
+        return self._dir.text().strip() or None
 
     @property
     def output_file(self) -> str | None:
-        return self._file_var.get().strip() or None
+        return self._file.text().strip() or None
 
     @property
     def in_place(self) -> bool:
-        return self._mode.get() == "inplace"
+        return self.mode == "inplace"
 
     @property
     def backup(self) -> bool:
-        return self._backup_var.get()
+        return self._backup.isChecked() and self.in_place
 
     @property
     def no_overwrite(self) -> bool:
-        return self._noover_var.get()
+        return self._no_over.isChecked()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab: Advanced (updated with --jobs and --convert)
+# Advanced panel
 # ─────────────────────────────────────────────────────────────────────────────
-
-class AdvancedTab(ctk.CTkFrame):
-    def __init__(self, master, **kw):
-        super().__init__(master, fg_color="transparent", **kw)
-        self.columnconfigure(0, weight=1)
+class AdvancedPanel(QGroupBox):
+    def __init__(self):
+        super().__init__("Advanced")
         self._build()
 
     def _build(self):
-        def _card():
-            f = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8,
-                             border_width=1, border_color=BORDER)
-            f.columnconfigure(0, weight=1)
-            return f
+        lay = QFormLayout(self)
+        lay.setContentsMargins(12, 18, 12, 12)
+        lay.setSpacing(10)
+        lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        # Fail-fast
-        err_card = _card()
-        err_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(err_card, text="ERROR HANDLING").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 6))
-        self._failfast_var = BooleanVar()
-        ctk.CTkCheckBox(err_card, text="Fail fast  -- stop immediately on the first error",
-                        variable=self._failfast_var,
-                        font=ctk.CTkFont("Courier New", 11),
-                        text_color=TEXT, fg_color=ACCENT,
-                        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        self._verbosity = QComboBox()
+        self._verbosity.addItem("Normal", "normal")
+        self._verbosity.addItem("Quiet (errors only)", "quiet")
+        self._verbosity.addItem("Verbose (debug)", "verbose")
+        lay.addRow(self._small("Log level"), self._verbosity)
 
-        # Verbosity
-        log_card = _card()
-        log_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(log_card, text="LOG VERBOSITY").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 6))
-        self._verbosity = StringVar(value="normal")
-        vf = ctk.CTkFrame(log_card, fg_color="transparent")
-        vf.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-        for val, lbl in [("quiet",   "Quiet  (errors only)"),
-                         ("normal",  "Normal"),
-                         ("verbose", "Verbose  (debug detail)")]:
-            ctk.CTkRadioButton(vf, text=lbl, variable=self._verbosity, value=val,
-                               font=ctk.CTkFont("Courier New", 11),
-                               text_color=TEXT, fg_color=ACCENT,
-                               ).pack(side="left", padx=(0, 20))
+        self._jobs = QSpinBox()
+        self._jobs.setRange(1, 16)
+        self._jobs.setValue(1)
+        self._jobs.setToolTip("Values > 1 process files in parallel worker processes.")
+        lay.addRow(self._small("Workers"), self._jobs)
 
-        # ── NEW: Parallel jobs ────────────────────────────────────────────
-        jobs_card = _card()
-        jobs_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(jobs_card, text="PARALLEL PROCESSING").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 4))
-        frame_jobs = ctk.CTkFrame(jobs_card, fg_color="transparent")
-        frame_jobs.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-        ctk.CTkLabel(frame_jobs, text="Workers:",
-                     font=ctk.CTkFont("Courier New", 11), text_color=TEXT).pack(side="left")
-        self._jobs_var = IntVar(value=1)
-        self._jobs_spin = CTkSpinbox(frame_jobs, start_value=1, min_value=1, max_value=16, step_value=1, variable=self._jobs_var, width=60, button_color=ACCENT, font=ctk.CTkFont("Courier New", 11), fg_color=CARD2, border_color=BORDER)
-        self._jobs_spin.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(frame_jobs, text="(1-16 worker processes – values >1 process files in parallel)", font=ctk.CTkFont("Courier New", 9), text_color=TEXT_DIM).pack(side="left", padx=(10, 0))
+        self._fail_fast = QCheckBox("Fail fast — stop on first error")
+        lay.addRow(self._fail_fast)
 
-        # ── NEW: Convert legacy formats (--convert) ────────────────────────
-        convert_card = _card()
-        convert_card.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(convert_card, text="AUTOMATIC CONVERSION").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 4))
-        self._convert_var = BooleanVar()
-        ck = ctk.CTkCheckBox(convert_card,
-                             text="Convert legacy binary formats to OpenXML (--convert)",
-                             variable=self._convert_var,
-                             font=ctk.CTkFont("Courier New", 11),
-                             text_color=TEXT, fg_color=ACCENT)
-        ck.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
-        ctk.CTkLabel(convert_card,
-                     text="Requires LibreOffice installed and in PATH. Converts .doc→.docx, .xls→.xlsx, .ppt→.pptx.\n"
-                          "Warning: macros may be lost during conversion.",
-                     font=ctk.CTkFont("Courier New", 9), text_color=WARN,
-                     wraplength=700, justify="left").grid(row=2, column=0, sticky="w", padx=12, pady=(0, 10))
+        self._convert = QCheckBox("Convert legacy formats (.doc/.xls/.ppt → OpenXML)")
+        lay.addRow(self._convert)
+        conv_note = QLabel("Needs LibreOffice on PATH. Macros may be lost.")
+        conv_note.setObjectName("Hint")
+        conv_note.setWordWrap(True)
+        lay.addRow(conv_note)
 
-        # JSON export
-        json_card = _card()
-        json_card.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        SectionLabel(json_card,
-                     text="JSON EXPORT  (Inspect/Check mode only -- mirrors --check --json)").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(8, 6))
-        self._json_var = BooleanVar()
-        ctk.CTkCheckBox(json_card,
-                        text="Emit machine-readable JSON results and offer to save to file",
-                        variable=self._json_var,
-                        font=ctk.CTkFont("Courier New", 11),
-                        text_color=TEXT, fg_color=ACCENT,
-                        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        self._json = QCheckBox("Emit JSON results  ·  Inspect mode only")
+        lay.addRow(self._json)
 
-    @property
-    def fail_fast(self) -> bool:
-        return self._failfast_var.get()
+    def _small(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("Hint")
+        return lbl
 
     @property
     def verbosity(self) -> str:
-        return self._verbosity.get()
-
-    @property
-    def json_export(self) -> bool:
-        return self._json_var.get()
+        return self._verbosity.currentData()
 
     @property
     def jobs(self) -> int:
-        return self._jobs_var.get()
+        return self._jobs.value()
+
+    @property
+    def fail_fast(self) -> bool:
+        return self._fail_fast.isChecked()
 
     @property
     def convert(self) -> bool:
-        return self._convert_var.get()
+        return self._convert.isChecked()
+
+    @property
+    def json_export(self) -> bool:
+        return self._json.isChecked()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Application (with scrollable area)
+# Summary chips + log
 # ─────────────────────────────────────────────────────────────────────────────
+class StatsChips(QWidget):
+    ORDER = [("unlocked", "unlocked"), ("open", "open"), ("protected", "protected"),
+             ("skipped", "skipped"), ("failed", "failed"), ("pending", "queued")]
 
-class UnprotectApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Unprotect")
-        self.geometry("860x880")
-        self.minsize(720, 680)
-        self.configure(fg_color=BG)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self._chips: dict[str, QLabel] = {}
+        for key, label in self.ORDER:
+            chip = QLabel(f"0 {label}")
+            chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._chips[key] = chip
+            lay.addWidget(chip)
+        lay.addStretch(1)
+        self.update_counts({})
 
-        self._q: queue.Queue = queue.Queue()
+    def update_counts(self, counts: dict[str, int]):
+        for key, label in self.ORDER:
+            n = counts.get(key, 0)
+            c = STATUS_COLOR.get(key, FAINT)
+            chip = self._chips[key]
+            chip.setText(f"{n} {label}")
+            on = n > 0
+            chip.setStyleSheet(
+                f"color: {c if on else FAINT};"
+                f" background-color: {ELEVATED if on else 'transparent'};"
+                f" border: 1px solid {c if on else BORDER};"
+                f" border-radius: 11px; padding: 3px 10px; font-size: 11px;"
+                f" font-weight: {'700' if on else '400'};"
+            )
+
+
+class LogPanel(QFrame):
+    LEVEL_COLOR = {"debug": MUTED, "info": TEXT, "ok": SUCCESS,
+                   "warn": WARN, "err": ERROR, "json": INFO}
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("ActionBar")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 12)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        title = QLabel("Output log")
+        title.setObjectName("Subtitle")
+        top.addWidget(title)
+        top.addStretch(1)
+        copy = QPushButton("Copy")
+        copy.setObjectName("Ghost")
+        copy.clicked.connect(self._copy)
+        clear = QPushButton("Clear")
+        clear.setObjectName("Ghost")
+        clear.clicked.connect(self.clear)
+        top.addWidget(copy)
+        top.addWidget(clear)
+        lay.addLayout(top)
+
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setMinimumHeight(140)
+        mono = QFont("Menlo")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(10)
+        self._text.setFont(mono)
+        lay.addWidget(self._text)
+
+    def append(self, text: str, level: str = "info"):
+        from html import escape
+        import time
+        color = self.LEVEL_COLOR.get(level, TEXT)
+        ts = time.strftime("%H:%M:%S")
+        self._text.appendHtml(
+            f'<span style="color:{FAINT}">[{ts}]</span> '
+            f'<span style="color:{color}">{escape(text)}</span>'
+        )
+        sb = self._text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def clear(self):
+        self._text.clear()
+
+    def _copy(self):
+        QGuiApplication.clipboard().setText(self._text.toPlainText())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workers (run in a QThread; communicate via signals)
+# ─────────────────────────────────────────────────────────────────────────────
+class _BaseWorker(QObject):
+    log = pyqtSignal(str, str)           # text, level
+    row = pyqtSignal(str, str, str)      # path, status, message
+    progress = pyqtSignal(float, str)    # fraction, "n/total"
+    finished = pyqtSignal()
+
+    def __init__(self, paths: list[str]):
+        super().__init__()
+        self._paths = paths
+
+
+class CheckWorker(_BaseWorker):
+    json_ready = pyqtSignal(str)
+
+    def __init__(self, paths, do_json: bool, fail_fast: bool):
+        super().__init__(paths)
+        self._do_json = do_json
+        self._fail_fast = fail_fast
+
+    def run(self):
+        total = len(self._paths)
+        acc: list[dict] = []
+        for i, path in enumerate(self._paths):
+            self.progress.emit(i / total, f"{i}/{total}")
+            self.row.emit(path, "running", "inspecting…")
+            try:
+                result = check_file(path)
+                self.row.emit(path, result.status, result.message)
+                level = {"open": "ok", "protected": "warn",
+                         "failed": "err"}.get(result.status, "info")
+                self.log.emit(f"{Path(path).name}: [{result.status}] {result.message}", level)
+                if self._do_json:
+                    acc.append({"file": path, "status": result.status,
+                                "layers": result.layers, "message": result.message})
+            except Exception as e:  # noqa: BLE001
+                self.row.emit(path, "failed", str(e))
+                self.log.emit(f"{Path(path).name}: {e}", "err")
+                if self._fail_fast:
+                    self.log.emit("Fail-fast: stopping after first error.", "warn")
+                    break
+        if self._do_json and acc:
+            blob = json.dumps(acc, indent=2)
+            self.log.emit("JSON output:", "info")
+            for line in blob.splitlines():
+                self.log.emit(line, "json")
+            self.json_ready.emit(blob)
+        self.progress.emit(1.0, f"{total}/{total}")
+        self.finished.emit()
+
+
+class UnprotectWorker(_BaseWorker):
+    def __init__(self, paths, *, password, pw_mode, wordlist_path,
+                 out_mode, output_file, output_dir, in_place, backup,
+                 no_overwrite, convert, fail_fast, jobs):
+        super().__init__(paths)
+        self._password = password
+        self._pw_mode = pw_mode
+        self._wordlist = wordlist_path
+        self._out_mode = out_mode
+        self._output_file = output_file
+        self._output_dir = output_dir
+        self._in_place = in_place
+        self._backup = backup
+        self._no_overwrite = no_overwrite
+        self._convert = convert
+        self._fail_fast = fail_fast
+        self._jobs = max(1, jobs)
+
+    def _call_for(self, path: str):
+        common = dict(
+            output_path=self._output_file if self._out_mode == "file" else None,
+            in_place=self._in_place,
+            output_dir=self._output_dir if self._out_mode == "dir" else None,
+            backup=self._backup,
+            no_overwrite=self._no_overwrite,
+            convert=self._convert,
+        )
+        if self._pw_mode == "list":
+            return _try_password_list, dict(input_path=path, wordlist_path=self._wordlist, **common)
+        return unprotect_file, dict(input_path=path, password=self._password, **common)
+
+    def run(self):
+        total = len(self._paths)
+        counts = {"unlocked": 0, "open": 0, "skipped": 0, "failed": 0}
+
+        def record(path, result):
+            self.row.emit(path, result.status, result.message)
+            level = {"unlocked": "ok", "skipped": "warn",
+                     "failed": "err", "open": "info"}.get(result.status, "info")
+            self.log.emit(f"{Path(path).name}: {result.message}", level)
+            counts[result.status if result.status in counts else "failed"] += 1
+
+        def record_error(path, exc, unexpected=False):
+            self.row.emit(path, "failed", str(exc))
+            prefix = "unexpected error — " if unexpected else ""
+            self.log.emit(f"{Path(path).name}: {prefix}{exc}", "err")
+            counts["failed"] += 1
+
+        if self._jobs > 1 and total > 1:
+            self.log.emit(f"Processing {total} files with {self._jobs} workers…", "info")
+            for p in self._paths:
+                self.row.emit(p, "running", "queued…")
+            done = 0
+            stop = False
+            with ProcessPoolExecutor(max_workers=self._jobs) as ex:
+                fut_to_path = {}
+                for path in self._paths:
+                    fn, kwargs = self._call_for(path)
+                    fut_to_path[ex.submit(fn, **kwargs)] = path
+                for fut in as_completed(fut_to_path):
+                    path = fut_to_path[fut]
+                    try:
+                        record(path, fut.result())
+                    except UnprotectError as e:
+                        record_error(path, e)
+                        stop = self._fail_fast
+                    except Exception as e:  # noqa: BLE001
+                        record_error(path, e, unexpected=True)
+                        stop = self._fail_fast
+                    done += 1
+                    self.progress.emit(done / total, f"{done}/{total}")
+                    if stop:
+                        self.log.emit("Fail-fast: cancelling remaining files.", "warn")
+                        for f in fut_to_path:
+                            f.cancel()
+                        break
+        else:
+            for i, path in enumerate(self._paths):
+                self.progress.emit(i / total, f"{i}/{total}")
+                self.row.emit(path, "running", "processing…")
+                try:
+                    fn, kwargs = self._call_for(path)
+                    record(path, fn(**kwargs))
+                except UnprotectError as e:
+                    record_error(path, e)
+                    if self._fail_fast:
+                        self.log.emit("Fail-fast: stopping after first error.", "warn")
+                        break
+                except Exception as e:  # noqa: BLE001
+                    record_error(path, e, unexpected=True)
+                    if self._fail_fast:
+                        self.log.emit("Fail-fast: stopping after first error.", "warn")
+                        break
+
+        if total > 1:
+            parts = []
+            for k, lbl in [("unlocked", "unlocked"), ("open", "already open"),
+                           ("skipped", "skipped"), ("failed", "failed")]:
+                if counts[k]:
+                    parts.append(f"{counts[k]} {lbl}")
+            self.log.emit("Done: " + (", ".join(parts) if parts else "nothing processed"), "info")
+
+        self.progress.emit(1.0, f"{total}/{total}")
+        self.finished.emit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────────────────────────────────────
+class UnprotectApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Unprotect")
+        self.resize(1040, 760)
+        self.setMinimumSize(860, 620)
+
+        self._thread: QThread | None = None
+        self._worker: _BaseWorker | None = None
         self._running = False
 
         self._build()
-        self._poll()
 
         if not _HAVE_LIB:
-            self.log("unprotect.py not found in the same directory.", "warn")
-            self.log("Place unprotect.py alongside this file and restart.", "warn")
+            self.log("unprotect.py not found alongside this file.", "warn")
+            self.log("Place unprotect.py in the same directory and restart.", "warn")
 
-    # ── Layout with scrollable area ───────────────────────────────────────
-
+    # ── Layout ───────────────────────────────────────────────────────────────
     def _build(self):
-        # Header
-        hdr = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0, height=52)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="UNPROTECT",
-                     font=ctk.CTkFont("Courier New", 17, "bold"),
-                     text_color=TEXT).pack(side="left", padx=(18, 6))
-        ctk.CTkLabel(hdr, text="PDF  XLSX  DOCX  PPTX",
-                     font=ctk.CTkFont("Courier New", 9),
-                     text_color=TEXT_DIM).pack(side="left", padx=4)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
 
-        self._count_var = StringVar(value="0 files")
-        ctk.CTkLabel(hdr, textvariable=self._count_var, height=24,
-                     font=ctk.CTkFont("Courier New", 9, "bold"),
-                     fg_color=CARD, corner_radius=12, text_color=INFO,
-                     padx=12).pack(side="right", padx=18)
+        root.addWidget(self._header())
 
-        # Main scrollable area
-        main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent",
-                                             scrollbar_button_color=BORDER,
-                                             scrollbar_button_hover_color=ACCENT)
-        main_scroll.pack(fill="both", expand=True, padx=14, pady=10)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(12)
 
-        # Place everything inside the scrollable frame
-        body = ctk.CTkFrame(main_scroll, fg_color="transparent")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
+        self._input_tab = InputPanel()
+        self._input_tab.changed.connect(self._refresh_stats)
+        split.addWidget(self._input_tab)
 
-        # Tabview
-        self._tabs = ctk.CTkTabview(
-            body,
-            fg_color=SURFACE,
-            segmented_button_fg_color=CARD,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_H,
-            segmented_button_unselected_color=CARD,
-            segmented_button_unselected_hover_color=BORDER,
-            text_color=TEXT,
-            border_width=1, border_color=BORDER,
-            corner_radius=10,
-        )
-        self._tabs.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        split.addWidget(self._settings_column())
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([580, 430])
+        root.addWidget(split, 1)
 
-        for name in ("Files", "Password", "Output", "Advanced"):
-            self._tabs.add(name)
-            self._tabs.tab(name).configure(fg_color="transparent")
-            self._tabs.tab(name).columnconfigure(0, weight=1)
-            self._tabs.tab(name).rowconfigure(0, weight=1)
+        root.addWidget(self._action_bar())
+        self._log_panel = LogPanel()
+        root.addWidget(self._log_panel)
 
-        self._input_tab    = InputTab(   self._tabs.tab("Files"),    app=self)
-        self._password_tab = PasswordTab(self._tabs.tab("Password"))
-        self._output_tab   = OutputTab(  self._tabs.tab("Output"))
-        self._advanced_tab = AdvancedTab(self._tabs.tab("Advanced"))
+        self.setStyleSheet(STYLESHEET)
+        self._refresh_stats()
 
-        for tab in (self._input_tab, self._password_tab,
-                    self._output_tab, self._advanced_tab):
-            tab.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+    def _header(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("Header")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(18, 12, 18, 12)
+        title = QLabel("Unprotect")
+        title.setObjectName("Title")
+        sub = QLabel("PDF · XLSX · DOCX · PPTX")
+        sub.setObjectName("Subtitle")
+        lay.addWidget(title)
+        lay.addSpacing(10)
+        lay.addWidget(sub)
+        lay.addStretch(1)
+        self._count = QLabel("0 files")
+        self._count.setStyleSheet(
+            f"color: {INFO}; background-color: {ELEVATED}; border: 1px solid {BORDER};"
+            f" border-radius: 12px; padding: 4px 12px; font-weight: 600;")
+        lay.addWidget(self._count)
+        return bar
 
-        # Action bar
-        act = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=8,
-                           border_width=1, border_color=BORDER)
-        act.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        act.columnconfigure(3, weight=1)
+    def _settings_column(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(0, 0, 4, 0)
+        lay.setSpacing(10)
 
-        self._check_btn = ctk.CTkButton(
-            act, text="Inspect / Check",
-            width=148, height=40,
-            font=ctk.CTkFont("Courier New", 11, "bold"),
-            fg_color=CARD, hover_color=BORDER,
-            border_color=BORDER, border_width=1,
-            text_color=TEXT,
-            command=self._run_check,
-        )
-        self._check_btn.pack(side="left", padx=(10, 6), pady=10)
+        self._password_tab = PasswordPanel()
+        self._output_tab = OutputPanel()
+        self._advanced_tab = AdvancedPanel()
+        for w in (self._password_tab, self._output_tab, self._advanced_tab):
+            w.setMinimumWidth(0)
+            lay.addWidget(w)
+        lay.addStretch(1)
 
-        self._run_btn = ctk.CTkButton(
-            act, text="Unprotect",
-            width=140, height=40,
-            font=ctk.CTkFont("Courier New", 12, "bold"),
-            fg_color=ACCENT, hover_color=ACCENT_H,
-            text_color="#fff",
-            command=self._run_unprotect,
-        )
-        self._run_btn.pack(side="left", padx=(0, 10), pady=10)
+        # Let combo boxes shrink below their longest item so the column never
+        # forces horizontal overflow; the dropdown still shows full labels.
+        for combo in host.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        scroll.setWidget(host)
+        scroll.setMinimumWidth(320)
+        return scroll
 
-        self._progress = ctk.CTkProgressBar(act, width=160, height=7,
-                                            fg_color=BORDER, progress_color=ACCENT)
-        self._progress.pack(side="left", pady=10)
-        self._progress.set(0)
+    def _action_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("ActionBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(10)
 
-        self._prog_lbl = ctk.CTkLabel(act, text="",
-                                      font=ctk.CTkFont("Courier New", 9),
-                                      text_color=TEXT_DIM)
-        self._prog_lbl.pack(side="left", padx=8)
+        self._check_btn = QPushButton("Inspect")
+        self._check_btn.clicked.connect(self._run_check)
+        lay.addWidget(self._check_btn)
 
-        # Live summary chips
-        self._stats_bar = StatsBar(body)
-        self._stats_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self._run_btn = QPushButton("Unprotect")
+        self._run_btn.setObjectName("Primary")
+        self._run_btn.clicked.connect(self._run_unprotect)
+        lay.addWidget(self._run_btn)
 
-        # Log
-        self._log_panel = LogPanel(body)
-        self._log_panel.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self._progress = QProgressBar()
+        self._progress.setFixedWidth(170)
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
+        lay.addWidget(self._progress)
 
-    # ── Logging ───────────────────────────────────────────────────────────
+        self._prog_lbl = QLabel("")
+        self._prog_lbl.setObjectName("Hint")
+        self._prog_lbl.setFixedWidth(60)
+        lay.addWidget(self._prog_lbl)
 
+        lay.addStretch(1)
+        self._stats = StatsChips()
+        lay.addWidget(self._stats, 1)
+        return bar
+
+    # ── Logging / stats ──────────────────────────────────────────────────────
     def log(self, text: str, level: str = "info"):
         verbosity = self._advanced_tab.verbosity if hasattr(self, "_advanced_tab") else "normal"
         if verbosity == "quiet" and level not in ("err", "warn"):
@@ -870,297 +1077,147 @@ class UnprotectApp(ctk.CTk):
             return
         self._log_panel.append(text, level)
 
-    # ── Live stats ────────────────────────────────────────────────────────
-
     def _refresh_stats(self):
-        """Recompute the header count and summary chips from current row states."""
         rows = self._input_tab.file_rows
-        self._count_var.set(f"{len(rows)} file" + ("" if len(rows) == 1 else "s"))
+        n = len(rows)
+        self._count.setText(f"{n} file" + ("" if n == 1 else "s"))
         counts: dict[str, int] = {}
         for r in rows:
             counts[r.status] = counts.get(r.status, 0) + 1
-        self._stats_bar.update_counts(counts)
+        self._stats.update_counts(counts)
 
-    # ── Busy state ────────────────────────────────────────────────────────
+    def _row_by_path(self, path: str) -> FileRow | None:
+        for r in self._input_tab.file_rows:
+            if r.path == path:
+                return r
+        return None
 
+    # ── Busy state ───────────────────────────────────────────────────────────
     def _set_busy(self, busy: bool):
         self._running = busy
-        s = "disabled" if busy else "normal"
-        self._run_btn.configure(state=s)
-        self._check_btn.configure(state=s)
+        self._run_btn.setEnabled(not busy)
+        self._check_btn.setEnabled(not busy)
         if not busy:
-            self._progress.set(0)
-            self._prog_lbl.configure(text="")
+            self._progress.setValue(0)
+            self._prog_lbl.setText("")
 
-    # ── Validation ────────────────────────────────────────────────────────
-
-    def _validate(self, check_only: bool = False) -> bool:
+    # ── Validation ───────────────────────────────────────────────────────────
+    def _validate(self, check_only: bool) -> bool:
         if not _HAVE_LIB:
-            messagebox.showerror("Missing library", "unprotect.py not found. See log.")
+            QMessageBox.critical(self, "Missing library", "unprotect.py not found. See log.")
             return False
-
         rows = self._input_tab.file_rows
         if not rows:
-            messagebox.showwarning("No files", "Add at least one file first.")
+            QMessageBox.warning(self, "No files", "Add at least one file first.")
             return False
 
-        out = self._output_tab
-        pw  = self._password_tab
-        adv = self._advanced_tab
-
-        if out.backup and not out.in_place:
-            messagebox.showwarning(
-                "Config error",
-                "Backup (.bak) only works with In-place mode.\n"
-                "Switch Output mode to 'In-place' or uncheck Backup.")
-            return False
+        out, pw, adv = self._output_tab, self._password_tab, self._advanced_tab
 
         if out.mode == "file" and len(rows) > 1:
-            messagebox.showwarning(
-                "Config error",
-                "Explicit output path is single-file mode only.\n"
-                "Either remove extra files or switch to 'Output directory' mode.")
+            QMessageBox.warning(self, "Config error",
+                                "Explicit output path is single-file mode only.")
             return False
-
-        if pw.mode == "file" and not self._password_tab._pf_var.get().strip():
-            messagebox.showwarning("Config error",
-                                   "Password file mode selected but no file path entered.")
+        if pw.mode == "file" and not pw.password_file_path:
+            QMessageBox.warning(self, "Config error", "Password-file mode selected but no path given.")
             return False
-
         if pw.mode == "list" and not pw.wordlist_path:
-            messagebox.showwarning("Config error",
-                                   "Wordlist mode selected but no wordlist file chosen.")
+            QMessageBox.warning(self, "Config error", "Wordlist mode selected but no wordlist chosen.")
             return False
-
         if adv.json_export and not check_only:
-            messagebox.showwarning(
-                "Config error",
-                "JSON export is only available with 'Inspect / Check' mode,\n"
-                "not with Unprotect.")
+            QMessageBox.warning(self, "Config error", "JSON export is only available with Inspect.")
             return False
-
-        # Warn about conversion without LibreOffice (but don't block)
-        if not check_only and adv.convert:
-            import shutil
-            if not shutil.which("libreoffice"):
-                response = messagebox.askyesno(
-                    "LibreOffice missing",
-                    "Conversion requires LibreOffice to be installed and in PATH.\n"
-                    "Without it, conversion will fail.\n\n"
-                    "Do you want to continue anyway?",
-                    icon="warning"
-                )
-                if not response:
-                    return False
-
+        if not check_only and adv.convert and not shutil.which("libreoffice"):
+            resp = QMessageBox.question(
+                self, "LibreOffice missing",
+                "Conversion needs LibreOffice on PATH; without it, conversion will fail.\n\n"
+                "Continue anyway?")
+            if resp != QMessageBox.StandardButton.Yes:
+                return False
         return True
 
-    # ── Run Check ─────────────────────────────────────────────────────────
-
+    # ── Run: Check ───────────────────────────────────────────────────────────
     def _run_check(self):
-        if not self._validate(check_only=True):
+        if self._running or not self._validate(check_only=True):
             return
-        self._set_busy(True)
+        paths = [r.path for r in self._input_tab.file_rows]
         for r in self._input_tab.file_rows:
-            r.set_status("running", "inspecting...")
-        threading.Thread(target=self._worker_check, daemon=True).start()
+            r.set_status("running", "inspecting…")
+        self._refresh_stats()
+        worker = CheckWorker(paths, self._advanced_tab.json_export, self._advanced_tab.fail_fast)
+        worker.json_ready.connect(self._offer_json_save)
+        self._start(worker)
 
-    def _worker_check(self):
-        rows      = list(self._input_tab.file_rows)
-        total     = len(rows)
-        do_json   = self._advanced_tab.json_export
-        fail_fast = self._advanced_tab.fail_fast
-        json_acc: list[dict] = []
-
-        for i, row in enumerate(rows):
-            self._q.put(("progress", i / total, f"{i}/{total}"))
-            try:
-                result = check_file(row.path)
-                self._q.put(("row", row, result.status, result.message))
-                level = {"open": "ok", "protected": "warn", "failed": "err"}.get(result.status, "info")
-                self._q.put(("log", f"{Path(row.path).name}: [{result.status}] {result.message}", level))
-                if do_json:
-                    json_acc.append({"file": row.path, "status": result.status,
-                                     "layers": result.layers, "message": result.message})
-            except Exception as e:
-                self._q.put(("row", row, "failed", str(e)))
-                self._q.put(("log", f"{Path(row.path).name}: {e}", "err"))
-                if fail_fast:
-                    self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
-                    break
-
-        if do_json and json_acc:
-            blob = json.dumps(json_acc, indent=2)
-            self._q.put(("log", "JSON output:", "info"))
-            for line in blob.splitlines():
-                self._q.put(("log", line, "json"))
-            self._q.put(("json_save", blob))
-
-        self._q.put(("progress", 1.0, f"{total}/{total}"))
-        self._q.put(("done", None))
-
-    # ── Run Unprotect ─────────────────────────────────────────────────────
-
+    # ── Run: Unprotect ───────────────────────────────────────────────────────
     def _run_unprotect(self):
-        if not self._validate(check_only=False):
+        if self._running or not self._validate(check_only=False):
             return
-        self._set_busy(True)
-        for r in self._input_tab.file_rows:
-            r.set_status("pending", "queued...")
-        threading.Thread(target=self._worker_unprotect, daemon=True).start()
-
-    def _worker_unprotect(self):
-        rows      = list(self._input_tab.file_rows)
-        total     = len(rows)
-        out       = self._output_tab
-        pw        = self._password_tab
-        adv       = self._advanced_tab
-        fail_fast = adv.fail_fast
-        convert_flag = adv.convert
-        jobs      = max(1, adv.jobs)
-
-        # Resolve password once (unless wordlist mode, resolved per-file)
-        password: str | None = None
-        if pw.mode != "list" and pw.mode != "none":
+        pw = self._password_tab
+        password = None
+        if pw.mode not in ("none", "list"):
             try:
                 password = pw.get_password()
             except (UnprotectError, OSError) as e:
-                self._q.put(("log", f"Password error: {e}", "err"))
-                self._q.put(("done", None))
+                QMessageBox.critical(self, "Password error", str(e))
                 return
+        paths = [r.path for r in self._input_tab.file_rows]
+        for r in self._input_tab.file_rows:
+            r.set_status("pending", "queued…")
+        self._refresh_stats()
+        out, adv = self._output_tab, self._advanced_tab
+        worker = UnprotectWorker(
+            paths, password=password, pw_mode=pw.mode, wordlist_path=pw.wordlist_path,
+            out_mode=out.mode, output_file=out.output_file, output_dir=out.output_dir,
+            in_place=out.in_place, backup=out.backup, no_overwrite=out.no_overwrite,
+            convert=adv.convert, fail_fast=adv.fail_fast, jobs=adv.jobs)
+        self._start(worker)
 
-        counts = {"unlocked": 0, "open": 0, "skipped": 0, "failed": 0}
+    # ── Thread plumbing ──────────────────────────────────────────────────────
+    def _start(self, worker: _BaseWorker):
+        self._set_busy(True)
+        thread = QThread()
+        worker.moveToThread(thread)
+        worker.log.connect(self.log)
+        worker.row.connect(self._on_row)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished)
+        thread.started.connect(worker.run)
+        self._thread, self._worker = thread, worker
+        thread.start()
 
-        # Shared per-file call: (callable, kwargs) usable both in-process and
-        # in a worker process. Both targets are module-level and all arguments
-        # are plain strings/bools, so they pickle cleanly for ProcessPoolExecutor.
-        def _call_for(path: str):
-            common = dict(
-                output_path=out.output_file if out.mode == "file" else None,
-                in_place=out.in_place,
-                output_dir=out.output_dir if out.mode == "dir" else None,
-                backup=out.backup,
-                no_overwrite=out.no_overwrite,
-                convert=convert_flag,
-            )
-            if pw.mode == "list":
-                return _try_password_list, dict(input_path=path,
-                                                wordlist_path=pw.wordlist_path, **common)
-            return unprotect_file, dict(input_path=path, password=password, **common)
+    def _on_row(self, path: str, status: str, message: str):
+        row = self._row_by_path(path)
+        if row is not None:
+            row.set_status(status, message)
+            self._refresh_stats()
 
-        def _record(row, result):
-            self._q.put(("row", row, result.status, result.message))
-            level = {"unlocked": "ok", "skipped": "warn",
-                     "failed": "err", "open": "info"}.get(result.status, "info")
-            self._q.put(("log", f"{Path(row.path).name}: {result.message}", level))
-            key = result.status if result.status in counts else "failed"
-            counts[key] += 1
+    def _on_progress(self, fraction: float, label: str):
+        self._progress.setValue(int(fraction * 1000))
+        self._prog_lbl.setText(label)
 
-        def _record_error(row, exc, unexpected=False):
-            self._q.put(("row", row, "failed", str(exc)))
-            prefix = "unexpected error -- " if unexpected else ""
-            self._q.put(("log", f"{Path(row.path).name}: {prefix}{exc}", "err"))
-            counts["failed"] += 1
-
-        if jobs > 1 and total > 1:
-            # ── Parallel path ──────────────────────────────────────────────
-            self._q.put(("log", f"Processing {total} files with {jobs} workers...", "info"))
-            path_to_row = {r.path: r for r in rows}
-            for r in rows:
-                self._q.put(("row", r, "running", "queued..."))
-            done = 0
-            stop = False
-            with ProcessPoolExecutor(max_workers=jobs) as executor:
-                fut_to_path = {}
-                for row in rows:
-                    fn, kwargs = _call_for(row.path)
-                    fut_to_path[executor.submit(fn, **kwargs)] = row.path
-                for future in as_completed(fut_to_path):
-                    row = path_to_row[fut_to_path[future]]
-                    try:
-                        _record(row, future.result())
-                    except UnprotectError as e:
-                        _record_error(row, e)
-                        stop = fail_fast
-                    except Exception as e:
-                        _record_error(row, e, unexpected=True)
-                        stop = fail_fast
-                    done += 1
-                    self._q.put(("progress", done / total, f"{done}/{total}"))
-                    if stop:
-                        self._q.put(("log", "Fail-fast: cancelling remaining files.", "warn"))
-                        for f in fut_to_path:
-                            f.cancel()
-                        break
-        else:
-            # ── Sequential path ────────────────────────────────────────────
-            for i, row in enumerate(rows):
-                self._q.put(("progress", i / total, f"{i}/{total}"))
-                self._q.put(("row", row, "running", "processing..."))
-                try:
-                    fn, kwargs = _call_for(row.path)
-                    _record(row, fn(**kwargs))
-                except UnprotectError as e:
-                    _record_error(row, e)
-                    if fail_fast:
-                        self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
-                        break
-                except Exception as e:
-                    _record_error(row, e, unexpected=True)
-                    if fail_fast:
-                        self._q.put(("log", "Fail-fast: stopping after first error.", "warn"))
-                        break
-
-        # Batch summary
-        if total > 1:
-            parts = []
-            if counts["unlocked"]: parts.append(f"{counts['unlocked']} unlocked")
-            if counts["open"]:     parts.append(f"{counts['open']} already open")
-            if counts["skipped"]:  parts.append(f"{counts['skipped']} skipped")
-            if counts["failed"]:   parts.append(f"{counts['failed']} failed")
-            self._q.put(("log", "Done: " + (", ".join(parts) if parts else "nothing processed"), "info"))
-
-        self._q.put(("progress", 1.0, f"{total}/{total}"))
-        self._q.put(("done", None))
-
-    # ── Queue poll ────────────────────────────────────────────────────────
-
-    def _poll(self):
-        try:
-            while True:
-                msg = self._q.get_nowait()
-                kind = msg[0]
-                if kind == "log":
-                    self.log(msg[1], msg[2])
-                elif kind == "row":
-                    _, row, status, message = msg
-                    if row.winfo_exists():
-                        row.set_status(status, message)
-                        self._refresh_stats()
-                elif kind == "progress":
-                    self._progress.set(msg[1])
-                    self._prog_lbl.configure(text=msg[2])
-                elif kind == "json_save":
-                    self._offer_json_save(msg[1])
-                elif kind == "done":
-                    self._set_busy(False)
-        except queue.Empty:
-            pass
-        self.after(40, self._poll)
+    def _on_finished(self):
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+        self._thread = self._worker = None
+        self._set_busy(False)
 
     def _offer_json_save(self, blob: str):
-        path = filedialog.asksaveasfilename(
-            title="Save JSON results",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save JSON results", "results.json", "JSON (*.json);;All files (*.*)")
         if path:
             with open(path, "w") as f:
                 f.write(blob)
-            self.log(f"JSON saved -> {path}", "ok")
+            self.log(f"JSON saved → {path}", "ok")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Unprotect")
+    win = UnprotectApp()
+    win.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    app = UnprotectApp()
-    app.mainloop()
+    main()
