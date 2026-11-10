@@ -25,7 +25,7 @@ from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
-    QLineEdit, QCheckBox, QRadioButton, QButtonGroup, QSpinBox, QComboBox,
+    QLineEdit, QCheckBox, QSpinBox, QComboBox,
     QFileDialog, QMessageBox, QScrollArea, QSplitter, QGroupBox,
     QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout, QPlainTextEdit,
     QProgressBar, QSizePolicy,
